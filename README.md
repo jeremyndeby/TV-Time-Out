@@ -1,6 +1,6 @@
 # TV Time Out
 
-A Chrome extension to export your TV Time library.
+A Chrome extension to export your TV Time library fast.
 
 ## Features
 
