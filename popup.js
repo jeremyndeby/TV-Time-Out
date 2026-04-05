@@ -234,7 +234,7 @@ async function init() {
   const credentials = await ensureCredentials();
 
   if (!credentials?.token || !credentials?.userId) {
-    setStatus("Please log in to app.tvtime.com first.", "info");
+    setStatus("Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.", "info");
     btnExport.disabled = false;
     return;
   }
@@ -265,7 +265,7 @@ btnExport.addEventListener("click", async () => {
   const credentials = await ensureCredentials();
 
   if (!credentials?.token) {
-    setStatus("Please log in to app.tvtime.com first.", "error");
+    setStatus("Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.", "error");
     return;
   }
 

@@ -363,7 +363,7 @@ async function runExport(userId, token, tabId) {
       .map(f => showsNeedingSeasons.find(s => s.tvdbId === f.tvdbId))
       .filter(Boolean);
 
-    const MAX_RETRIES = 5;
+    const MAX_RETRIES = 10;
     let attempt = 0;
 
     while (retryList.length > 0 && attempt < MAX_RETRIES) {
