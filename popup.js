@@ -20,6 +20,8 @@ const progressBar   = document.getElementById("progress-bar");
 const fetchCountEl  = document.getElementById("fetch-count");
 const elapsedEl     = document.getElementById("elapsed-time");
 const btnExport     = document.getElementById("btn-export");
+const warningBar       = document.getElementById("warning-bar");
+const warningBarMovies = document.getElementById("warning-bar-movies");
 
 // ---------------------------------------------------------------------------
 // Local state
@@ -39,13 +41,13 @@ function setStatus(text, type = "info", showSpinner = false) {
     : text;
 }
 
-const STEP_PCT = { 1: 15, 2: 40, 3: 100 };
+const STEP_PCT = { 1: 10, 2: 30, 3: 30 };
 
-function showProgress(stepIndex = 0, fetchCount = "") {
+function showProgress(stepIndex = 0, fetchCount = "", pct = null) {
   progressWrap.classList.add("visible");
-  const pct = STEP_PCT[stepIndex] ?? 0;
-  currentProgress = pct;
-  progressBar.style.width = pct + "%";
+  const computedPct = pct !== null ? pct : (STEP_PCT[stepIndex] ?? 0);
+  currentProgress = computedPct;
+  progressBar.style.width = computedPct + "%";
   if (fetchCount) fetchCountEl.textContent = fetchCount;
 }
 
@@ -141,9 +143,11 @@ function handleExportDone(state) {
   stopTimer();
   hideProgress();
 
-  const r      = state?.result ?? {};
-  const shows  = r.shows?.length  ?? 0;
-  const movies = r.movies?.length ?? 0;
+  const r            = state?.result ?? {};
+  const shows        = r.shows?.length        ?? 0;
+  const movies       = r.movies?.length       ?? 0;
+  const failed       = r.failedShows?.length  ?? 0;
+  const failedMovies = r.failedMovies?.length ?? 0;
 
   const parts = [];
   if (shows)  parts.push(`${shows} shows`);
@@ -152,13 +156,32 @@ function handleExportDone(state) {
   setStatus(`✓ ${parts.join(" · ")} exported. Downloading files…`, "success");
   btnExport.disabled = false;
 
+  // Warning bar séries — affiché seulement si des séries ont échoué
+  if (failed > 0) {
+    warningBar.textContent = `⚠️ ${failed} series missing seasons (server timeout) — see report file`;
+    warningBar.classList.add("visible");
+  } else {
+    warningBar.classList.remove("visible");
+  }
+
+  // Warning bar films — affiché seulement si des films ont un titre null
+  if (failedMovies > 0) {
+    warningBarMovies.textContent = `⚠️ ${failedMovies} movies could not be exported — see report file`;
+    warningBarMovies.classList.add("visible");
+  } else {
+    warningBarMovies.classList.remove("visible");
+  }
+
   // Auto-download — no user click required
   try {
     downloadAll(r);
     // Update message after downloads are queued
+    const fileCount = [shows, movies].filter(Boolean).length + (failed > 0 ? 1 : 0) + (failedMovies > 0 ? 1 : 0);
+    const durationS = r.durationMs ? Math.round(r.durationMs / 1000) : null;
+    const durationStr = durationS !== null ? ` (${durationS}s)` : "";
     setTimeout(() => {
-      setStatus(`🎉 Great success! Export complete & files saved.`, "success");
-    }, [shows, movies].filter(Boolean).length * 600 + 200);
+      setStatus(`🎉 Great success! Export complete & files saved.${durationStr}`, "success");
+    }, fileCount * 600 + 200);
   } catch (e) {
     setStatus(`Export done but download failed: ${e.message}`, "error");
   }
@@ -167,7 +190,7 @@ function handleExportDone(state) {
 function handleExportState(state) {
   switch (state.status) {
     case "running":
-      showProgress(state.stepIndex, state.fetchCount);
+      showProgress(state.stepIndex, state.fetchCount, state.pct ?? null);
       setStatus(state.step || "Fetching your data…", "running", true);
       btnExport.disabled = true;
       break;

@@ -125,6 +125,22 @@
     #btn-export:active:not(:disabled) { transform: scale(0.98); }
     #btn-export:disabled              { opacity: 0.45; cursor: not-allowed; }
 
+    /* Warning bars (échecs séries et films) */
+    #warning-bar,
+    #warning-bar-movies {
+      display: none;
+      font-size: 0.75rem;
+      color: #f5a623;
+      background: rgba(245, 166, 35, 0.1);
+      border: 1px solid rgba(245, 166, 35, 0.35);
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-top: 10px;
+      line-height: 1.4;
+    }
+    #warning-bar.visible,
+    #warning-bar-movies.visible { display: block; }
+
     /* Divider + footer */
     .divider {
       height: 1px;
@@ -175,6 +191,9 @@
   </div>
 
   <button id="btn-export">Export my data</button>
+
+  <div id="warning-bar"></div>
+  <div id="warning-bar-movies"></div>
 
   <div class="divider"></div>
   <div class="footer">100% client-side &mdash; no data leaves your browser</div>

@@ -178,7 +178,7 @@ async function fetchObjectsViaTab(tabId, innerUrl, entityType, pageLimit) {
 // toutes les 200 ms, avec un timeout max de maxMs.
 // Clé unique par tvdbId → appels parallèles sans collision.
 // ---------------------------------------------------------------------------
-async function waitForResult(tabId, tvdbId, maxMs = 8000) {
+async function waitForResult(tabId, tvdbId, maxMs = 55000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
     await new Promise(r => setTimeout(r, 200));
@@ -240,6 +240,22 @@ async function fetchSingleViaTab(tabId, tvdbId) {
 }
 
 // ---------------------------------------------------------------------------
+// Formate un watched_at ISO 8601 en "YYYY-MM-DD HH:MM:SS".
+// Entrée : "2024-01-21T00:33:46.403717Z" (ou toute variante ISO)
+// Sortie : "2024-01-21 00:33:46"
+// Retourne null si la valeur est null / undefined / non parseable.
+// ---------------------------------------------------------------------------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function formatWatchedAt(raw) {
+  if (!raw) return null;
+  // Remplace le T par un espace et coupe tout ce qui suit les secondes
+  const s = raw.replace("T", " ").replace(/(\d{2}:\d{2}:\d{2}).*$/, "$1");
+  // Vérifie qu'on obtient bien "YYYY-MM-DD HH:MM:SS" (19 chars)
+  return s.length >= 19 ? s.substring(0, 19) : null;
+}
+
+// ---------------------------------------------------------------------------
 // Export 3 étapes :
 //   1. Shows follows (series + anime)
 //   2. Watch history (épisodes + films)
@@ -251,6 +267,7 @@ async function fetchSingleViaTab(tabId, tvdbId) {
 // Produit 2 fichiers au format TV Time Liberator : shows + movies.
 // ---------------------------------------------------------------------------
 async function runExport(userId, token, tabId) {
+  const exportStartTime = Date.now();
   const cgwBase    = "https://msapi.tvtime.com/prod/v1/tracking/cgw/follows/user/" + userId;
   const watchesBase= "https://msapi.tvtime.com/prod/v1/tracking/watches/user/"     + userId;
 
@@ -260,6 +277,7 @@ async function runExport(userId, token, tabId) {
     // -------------------------------------------------------------------------
     exportState.step      = "Step 1/3: Fetching your shows…";
     exportState.stepIndex = 1;
+    exportState.pct       = null;
 
     const seriesRaw = await fetchObjectsViaTab(tabId, cgwBase, "series", 1000);
     console.log(`[TVTO BG] Step 1a: ${seriesRaw.length} series`);
@@ -285,48 +303,99 @@ async function runExport(userId, token, tabId) {
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
     console.log(`[TVTO BG] Step 2a: ${episodeWatches.length} episode watches`);
 
-    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} ep watches fetched`;
+    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps watches fetched`;
 
-    // Index watched_at par episode_id
-    const watchedAtMap = {};
-    for (const w of episodeWatches) {
-      const eid = w.episode_id ?? w.meta?.id ?? null;
-      if (eid != null) watchedAtMap[eid] = w.watched_at ?? null;
-    }
-    console.log("[TVTO] watchedAtMap size:", Object.keys(watchedAtMap).length);
+    // Index watched_at par episode_id — clés normalisées en String pour éviter type mismatch
+    const watchedAtMap = new Map(
+      episodeWatches.map(w => [String(w.episode_id), w.watched_at ?? null])
+    );
+    console.log("[TVTO] watchedAtMap size:", watchedAtMap.size);
 
     // -------------------------------------------------------------------------
     // Étape 3 — Détails saisons/épisodes par série
-    // URL directe : https://api2.tozelabs.com/v2/show/{tvdbId}/extended/seasons
-    // Batches de 10 en parallèle pour éviter de saturer l'API
+    // Batch parallèle de 5, timeout individuel (10s) + timeout batch (15s).
+    // Pas de retry — évite les blocages du service worker MV3.
     // -------------------------------------------------------------------------
     exportState.step      = `Step 3/3: Fetching episode details… (0/${showsRaw.length})`;
     exportState.stepIndex = 3;
 
-    // Batches de 5 en parallèle — réduit la pression sur l'API, évite les timeouts
-    const BATCH_SIZE = 5;
+    const BATCH_SIZE   = 3;
+    const SHOW_TIMEOUT = 60000;
+    const failedShows  = [];
 
-    for (let i = 0; i < showsRaw.length; i += BATCH_SIZE) {
-      const batch = showsRaw.slice(i, i + BATCH_SIZE);
+    // Pré-calcul : liste plate des shows avec leur tvdbId et title
+    const showsNeedingSeasons = showsRaw.map(show => ({
+      tvdbId: show.meta?.id ?? null,
+      title:  show.meta?.name ?? show.meta?.title ?? null,
+      _ref:   show   // référence vers l'objet d'origine pour mutater show.seasons
+    })).filter(s => s.tvdbId != null);
 
-      await Promise.all(batch.map(async (show) => {
-        const tvdbId = show.meta?.id ?? null;
-        if (!tvdbId) { show.seasons = []; return; }
+    // Shows sans tvdbId → seasons vide directement
+    showsRaw.forEach(show => {
+      if (!show.meta?.id) show.seasons = [];
+    });
 
-        try {
-          const data   = await fetchSingleViaTab(tabId, tvdbId);
-          show.seasons = data?.seasons ?? data?.data?.seasons ?? [];
-        } catch (err) {
-          console.warn(`[TVTO BG] Saisons indisponibles pour tvdbId=${tvdbId}:`, err.message);
-          show.seasons   = [];
-        }
-      }));
-
-      const done = Math.min(i + BATCH_SIZE, showsRaw.length);
-      exportState.step = `Step 3/3: Fetching episode details… (${done}/${showsRaw.length})`;
+    for (let i = 0; i < showsNeedingSeasons.length; i += BATCH_SIZE) {
+      const batch = showsNeedingSeasons.slice(i, i + BATCH_SIZE);
+      const results = await Promise.allSettled(
+        batch.map(show =>
+          Promise.race([
+            fetchSingleViaTab(tabId, show.tvdbId),
+            new Promise(r => setTimeout(() => r(null), SHOW_TIMEOUT))
+          ])
+        )
+      );
+      results.forEach((res, j) => {
+        const show  = batch[j];
+        const value = res.status === "fulfilled" ? res.value : null;
+        show._ref.seasons = value?.seasons ?? value?.data?.seasons ?? [];
+        if (!value) failedShows.push({ title: show.title, tvdbId: show.tvdbId });
+      });
+      if (i % 15 === 0) {
+        const pct = 30 + Math.round((i / showsNeedingSeasons.length) * 70);
+        exportState.pct  = pct;
+        exportState.step = `Step 3/3: Fetching episode details… (${i + 1}/${showsNeedingSeasons.length})`;
+      }
     }
 
-    console.log(`[TVTO BG] Step 3: saisons récupérées pour ${showsRaw.length} shows`);
+    // Retry des séries échouées — jusqu'à 3 tentatives supplémentaires
+    let retryList = failedShows
+      .map(f => showsNeedingSeasons.find(s => s.tvdbId === f.tvdbId))
+      .filter(Boolean);
+
+    const MAX_RETRIES = 5;
+    let attempt = 0;
+
+    while (retryList.length > 0 && attempt < MAX_RETRIES) {
+      attempt++;
+      exportState.step = `⏳ Retrying ${retryList.length} failed series... (attempt ${attempt}/${MAX_RETRIES})`;
+      const stillFailed = [];
+
+      for (let i = 0; i < retryList.length; i += BATCH_SIZE) {
+        const batch = retryList.slice(i, i + BATCH_SIZE);
+        const results = await Promise.allSettled(
+          batch.map(show =>
+            Promise.race([
+              fetchSingleViaTab(tabId, show.tvdbId),
+              new Promise(r => setTimeout(() => r(null), SHOW_TIMEOUT))
+            ])
+          )
+        );
+        results.forEach((res, j) => {
+          const show  = batch[j];
+          const value = res.status === "fulfilled" ? res.value : null;
+          if (value) {
+            show._ref.seasons = value?.seasons ?? value?.data?.seasons ?? [];
+          } else {
+            stillFailed.push(show);
+          }
+        });
+      }
+      retryList = stillFailed;
+    }
+
+    const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));
+    console.warn("[seasons] Échecs finaux:", finalFailed.length, finalFailed);
 
     // -------------------------------------------------------------------------
     // Normalisation — Format TV Time Liberator
@@ -347,27 +416,35 @@ async function runExport(userId, token, tabId) {
           number:     ep.number,
           special:    ep.is_special ?? (season.number === 0),
           is_watched: ep.is_watched ?? false,
-          watched_at: watchedAtMap[ep.id] ?? null
+          watched_at: formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id)))
         }))
       }))
     }));
 
     // Films — cgwBase source unique : métadonnées + statut vu + watched_at
-    console.log("[MOVIE NORM] Premier film meta:", JSON.stringify(moviesRaw[0]?.meta)?.substring(0, 200));
-    console.log("[MOVIE NORM] Premier film keys:", Object.keys(moviesRaw[0] ?? {}));
     const movies = moviesRaw.map(m => {
-      const tvdbSource = m.meta?.external_sources?.find(s => s.source === "tvdb");
+      // Cherche les métadonnées dans les emplacements connus
+      const meta       = m.meta ?? m.content ?? m.movie ?? m.data ?? m ?? {};
+      const extSources = meta?.external_sources ?? [];
+      const tvdbSource = extSources.find?.(s => s.source === "tvdb" || s.source === "TVDB");
+      const tvdbId     = tvdbSource ? parseInt(tvdbSource.id) : (meta?.tvdb_id ?? meta?.id_tvdb ?? null);
+      const imdbId     = meta?.imdb_id ?? meta?.id_imdb ?? null;
+      const title      = meta?.name ?? meta?.title ?? meta?.original_name ?? null;
       return {
-        id:         { tvdb: tvdbSource ? parseInt(tvdbSource.id) : null, imdb: m.meta?.imdb_id ?? null },
+        id:         { tvdb: tvdbId, imdb: imdbId },
         uuid:       m.uuid,
         created_at: m.created_at,
-        title:      m.meta?.name ?? null,
+        title,
         watched_at: m.watched_at ?? null,
-        is_watched: m.extended?.is_watched ?? false
+        is_watched: m.extended?.is_watched ?? meta?.is_watched ?? false
       };
     });
 
-    const result = { shows, movies };
+    const failedMovies = movies
+      .filter(m => m.title === null)
+      .map(m => ({ uuid: m.uuid, title: null }));
+
+    const result = { shows, movies, failedShows: finalFailed, failedMovies, durationMs: Date.now() - exportStartTime };
 
     exportState = {
       status: "done",

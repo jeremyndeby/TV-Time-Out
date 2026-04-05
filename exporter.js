@@ -40,9 +40,9 @@ function toJsonBlob(data) {
 // ---------------------------------------------------------------------------
 
 /**
- * Télécharge les données au format TV Time Liberator (2 fichiers).
+ * Télécharge les données au format TV Time Liberator (2 ou 3 fichiers).
  *
- * @param {{ shows?: Array, movies?: Array }} result
+ * @param {{ shows?: Array, movies?: Array, failedShows?: Array }} result
  */
 export function downloadAll(result) {
   const date = new Date().toISOString().split("T")[0];
@@ -54,9 +54,32 @@ export function downloadAll(result) {
 
   if (!files.length) throw new Error("Aucune donnée à télécharger.");
 
+  // Rapport séries — 3ème fichier, seulement si des séries ont échoué
+  if (result.failedShows?.length > 0) {
+    const report = {
+      date,
+      total_failed: result.failedShows.length,
+      message: "These series could not be exported due to TV Time server timeout. Run the export again to retry.",
+      shows: result.failedShows
+    };
+    files.push({ name: `tvtime-failed-${date}.json`, blob: toJsonBlob(report) });
+  }
+
+  // Rapport films — 4ème fichier, seulement si des films sont sans titre
+  if (result.failedMovies?.length > 0) {
+    const report = {
+      date,
+      total_failed: result.failedMovies.length,
+      message: "These movies could not be exported. Run the export again to retry.",
+      movies: result.failedMovies
+    };
+    files.push({ name: `tvtime-failed-movies-${date}.json`, blob: toJsonBlob(report) });
+  }
+
   files.forEach((f, i) => {
     setTimeout(() => {
-      triggerDownload(toJsonBlob(result[f.key]), f.name);
+      const blob = f.blob ?? toJsonBlob(result[f.key]);
+      triggerDownload(blob, f.name);
     }, i * 600);
   });
 }
