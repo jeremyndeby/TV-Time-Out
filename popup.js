@@ -102,13 +102,17 @@ async function getCredentialsFromTab() {
       if (!tabs?.length) { resolve(null); return; }
       chrome.scripting.executeScript({
         target: { tabId: tabs[0].id },
+        world:  "MAIN",
         func: () => {
-          const token = (localStorage.getItem("flutter.jwtToken") || "").replace(/^"|"$/g, "");
-          const raw   = localStorage.getItem("flutter.user") || "";
-          let userId  = null;
-          const m = raw.match(/:(\d{4,})/);
-          if (m) userId = m[1];
-          return { token: token || null, userId };
+          const token  = (localStorage.getItem("flutter.jwtToken") || "").replace(/^"|"$/g, "");
+          const raw    = localStorage.getItem("flutter.user") || "";
+          let   userId = null;
+          try { userId = JSON.parse(raw)?.id ?? null; } catch (_) {}
+          if (!userId) {
+            const m = raw.match(/:(\d{4,})/);
+            if (m) userId = m[1];
+          }
+          return { token: token || null, userId: userId ? String(userId) : null };
         }
       }, (results) => {
         if (chrome.runtime.lastError) {
@@ -116,7 +120,8 @@ async function getCredentialsFromTab() {
           resolve(null); return;
         }
         const result = results?.[0]?.result;
-        console.log("[TVTO POPUP] executeScript result:", JSON.stringify(result));
+        console.log("[TVTO POPUP] executeScript raw result:", JSON.stringify(result));
+        console.log("[TVTO POPUP] token présent:", !!result?.token, "| userId:", result?.userId);
         if (!result?.token) { resolve(null); return; }
         resolve(result);
       });
@@ -178,9 +183,13 @@ function handleExportDone(state) {
     // Update message after downloads are queued
     const fileCount = [shows, movies].filter(Boolean).length + (failed > 0 ? 1 : 0) + (failedMovies > 0 ? 1 : 0);
     const durationS = r.durationMs ? Math.round(r.durationMs / 1000) : null;
-    const durationStr = durationS !== null ? ` (${durationS}s)` : "";
+    const parts = [];
+    if (durationS !== null) parts.push(`${durationS}s`);
+    if (shows)  parts.push(`${shows} shows`);
+    if (movies) parts.push(`${movies} movies`);
+    const summaryStr = parts.length ? ` (${parts.join(" · ")})` : "";
     setTimeout(() => {
-      setStatus(`🎉 Great success! Export complete & files saved.${durationStr}`, "success");
+      setStatus(`🎉 Great success! Export complete & files saved.${summaryStr}`, "success");
     }, fileCount * 600 + 200);
   } catch (e) {
     setStatus(`Export done but download failed: ${e.message}`, "error");
@@ -234,7 +243,7 @@ async function init() {
   const credentials = await ensureCredentials();
 
   if (!credentials?.token || !credentials?.userId) {
-    setStatus("Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.", "info");
+    setStatus(`Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.`, "info");
     btnExport.disabled = false;
     return;
   }
@@ -265,7 +274,7 @@ btnExport.addEventListener("click", async () => {
   const credentials = await ensureCredentials();
 
   if (!credentials?.token) {
-    setStatus("Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.", "error");
+    setStatus(`Please log in to <a href="https://www.tvtime.com/" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline;">app.tvtime.com</a> first.`, "error");
     return;
   }
 

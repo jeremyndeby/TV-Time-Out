@@ -34,7 +34,6 @@ let exportState = {
 chrome.storage.session.get(["credentials"], (result) => {
   if (result.credentials) {
     cachedCredentials = result.credentials;
-    console.log("[TVTO BG] Credentials restaurés depuis session storage.");
   }
 });
 
@@ -42,17 +41,14 @@ chrome.storage.session.get(["credentials"], (result) => {
 // Listener principal
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  console.log("[TVTO BG] Message reçu :", message.type);
   switch (message.type) {
 
     case "CREDENTIALS_FROM_PAGE": {
       const { userId, token } = message;
-      console.log("[TVTO BG] CREDENTIALS_FROM_PAGE reçu :", { userId, token: !!token });
       if (userId && token) {
         const creds = { userId, token };
         cachedCredentials = creds;
         chrome.storage.session.set({ credentials: creds }, () => {
-          console.log("[TVTO BG] Credentials stockés :", userId);
           sendResponse({ ok: true });
         });
       } else {
@@ -64,7 +60,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case "GET_CREDENTIALS": {
       chrome.storage.session.get(["credentials"], (data) => {
         if (data.credentials) cachedCredentials = data.credentials;
-        console.log("[TVTO BG] GET_CREDENTIALS retourne :", !!data.credentials?.token);
         sendResponse({ credentials: data.credentials ?? null });
       });
       return true;
@@ -78,8 +73,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       const token  = message.token  ?? cachedCredentials?.token;
       const userId = message.userId ?? cachedCredentials?.userId;
-      console.log("[TVTO BG] START_EXPORT userId :", userId, "token :", !!token);
-
       if (!token || !userId) {
         sendResponse({ ok: false, error: "Pas de credentials. Ouvre d'abord app.tvtime.com." });
         return false;
@@ -280,14 +273,10 @@ async function runExport(userId, token, tabId) {
     exportState.pct       = null;
 
     const seriesRaw = await fetchObjectsViaTab(tabId, cgwBase, "series", 1000);
-    console.log(`[TVTO BG] Step 1a: ${seriesRaw.length} series`);
-
     const animeRaw = await fetchObjectsViaTab(tabId, cgwBase, "anime", 1000);
-    console.log(`[TVTO BG] Step 1b: ${animeRaw.length} anime`);
 
     // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
     const moviesRaw = await fetchObjectsViaTab(tabId, cgwBase, "movie", 1000);
-    console.log(`[TVTO BG] Step 1c: ${moviesRaw.length} movies`);
 
     const showsRaw = [...seriesRaw, ...animeRaw];
     exportState.loaded     = showsRaw.length;
@@ -301,15 +290,16 @@ async function runExport(userId, token, tabId) {
     exportState.stepIndex = 2;
 
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
-    console.log(`[TVTO BG] Step 2a: ${episodeWatches.length} episode watches`);
 
-    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps watches fetched`;
+    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps fetched`;
 
     // Index watched_at par episode_id — clés normalisées en String pour éviter type mismatch
     const watchedAtMap = new Map(
-      episodeWatches.map(w => [String(w.episode_id), w.watched_at ?? null])
+      episodeWatches.map(w => [String(w.episode_id), {
+        watched_at:    w.watched_at    ?? null,
+        rewatch_count: w.rewatch_count ?? 0
+      }])
     );
-    console.log("[TVTO] watchedAtMap size:", watchedAtMap.size);
 
     // -------------------------------------------------------------------------
     // Étape 3 — Détails saisons/épisodes par série
@@ -363,7 +353,7 @@ async function runExport(userId, token, tabId) {
       .map(f => showsNeedingSeasons.find(s => s.tvdbId === f.tvdbId))
       .filter(Boolean);
 
-    const MAX_RETRIES = 10;
+    const MAX_RETRIES = 25;
     let attempt = 0;
 
     while (retryList.length > 0 && attempt < MAX_RETRIES) {
@@ -395,7 +385,6 @@ async function runExport(userId, token, tabId) {
     }
 
     const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));
-    console.warn("[seasons] Échecs finaux:", finalFailed.length, finalFailed);
 
     // -------------------------------------------------------------------------
     // Normalisation — Format TV Time Liberator
@@ -415,8 +404,9 @@ async function runExport(userId, token, tabId) {
           id:         { tvdb: ep.id ?? null, imdb: null },
           number:     ep.number,
           special:    ep.is_special ?? (season.number === 0),
-          is_watched: ep.is_watched ?? false,
-          watched_at: formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id)))
+          is_watched:    ep.is_watched ?? false,
+          watched_at:    formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.watched_at),
+          rewatch_count: watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.rewatch_count ?? 0
         }))
       }))
     }));
@@ -435,8 +425,9 @@ async function runExport(userId, token, tabId) {
         uuid:       m.uuid,
         created_at: m.created_at,
         title,
-        watched_at: m.watched_at ?? null,
-        is_watched: m.extended?.is_watched ?? meta?.is_watched ?? false
+        watched_at:    m.watched_at ?? null,
+        is_watched:    m.extended?.is_watched ?? meta?.is_watched ?? false,
+        rewatch_count: m.rewatch_count ?? 0
       };
     });
 
@@ -455,8 +446,6 @@ async function runExport(userId, token, tabId) {
       result,
       error:  null
     };
-
-    console.log(`[TVTO BG] Export terminé : ${shows.length} séries/animés, ${movies.length} films.`);
 
   } catch (err) {
     exportState = {
