@@ -125,6 +125,32 @@
     #btn-export:active:not(:disabled) { transform: scale(0.98); }
     #btn-export:disabled              { opacity: 0.45; cursor: not-allowed; }
 
+    /* Format selector */
+    .format-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+    .format-row label { flex-shrink: 0; }
+    #format-select {
+      flex: 1;
+      background: #2a1a3a;
+      color: #ffffff;
+      border: 1px solid #6b2d8b;
+      border-radius: 8px;
+      padding: 6px 32px 6px 12px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23f5c518'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+    }
+
     /* Warning bars (échecs séries et films) */
     #warning-bar,
     #warning-bar-movies {
@@ -166,6 +192,17 @@
       flex-shrink: 0;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Version label */
+    body { position: relative; }
+    #version-label {
+      position: absolute;
+      bottom: 0;
+      right: 0;
+      font-size: 10px;
+      color: #555555;
+      padding: 4px 8px;
+    }
   </style>
 </head>
 <body>
@@ -177,7 +214,7 @@
   </div>
 
   <div id="status-bar">
-    <span id="status-text">Open <a href="https://app.tvtime.com" target="_blank" style="color: #f5c518;">app.tvtime.com</a> to get started.</span>
+    <span id="status-text">Please log in at <a href="https://app.tvtime.com" target="_blank" style="color: #f5c518;">app.tvtime.com</a> to get started.</span>
   </div>
 
   <div id="progress-wrap">
@@ -190,6 +227,15 @@
     </div>
   </div>
 
+  <div class="format-row">
+    <label for="format-select">Format</label>
+    <select id="format-select">
+      <option value="json">JSON</option>
+      <option value="csv">CSV</option>
+      <option value="both">Both</option>
+    </select>
+  </div>
+
   <button id="btn-export">Export my data</button>
 
   <div id="warning-bar"></div>
@@ -197,6 +243,8 @@
 
   <div class="divider"></div>
   <div class="footer">100% client-side &mdash; no data leaves your browser</div>
+
+  <div id="version-label"></div>
 
   <script type="module" src="popup.js"></script>
 </body>

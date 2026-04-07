@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TV Time Out",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Exporte tes données TV Time (séries suivies, épisodes vus, statuts) en CSV ou JSON.",
 
   "permissions": [
@@ -18,14 +18,6 @@
     "service_worker": "background.js",
     "type": "module"
   },
-
-  "content_scripts": [
-    {
-      "matches": ["https://app.tvtime.com/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ],
 
   "action": {
     "default_popup": "popup.html",

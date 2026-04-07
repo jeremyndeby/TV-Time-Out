@@ -100,7 +100,7 @@ export function normalizeShow(obj) {
     uuid:        obj.uuid                            ?? null,
     name:        obj.meta?.name ?? obj.meta?.title   ?? null,
     entity_type: obj.entity_type                     ?? null,
-    status:      obj.meta?.is_ended ? "ended" : "continuing",
+    status:      obj.filter?.[1] ?? "unknown",
     created_at:  obj.created_at                      ?? null,
     updated_at:  obj.updated_at                      ?? null,
     tvdb_id:     obj.meta?.id                        ?? null,

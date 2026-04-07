@@ -24,7 +24,7 @@ let exportState = {
   fetchCount: "",       // ex: "676 shows · 28 movies fetched"
   loaded:     0,
   total:      null,
-  result:     null,     // { shows, movies } quand done
+  result:     null,     // { shows, movies, lists } quand done
   error:      null
 };
 
@@ -86,7 +86,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
 
-        exportState = { status: "running", step: "Step 1/3: Fetching your shows…", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
+        exportState = { status: "running", step: "Step 1/4: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
         sendResponse({ ok: true });
 
         runExport(userId, token, tabs[0].id);
@@ -249,15 +249,73 @@ function formatWatchedAt(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Export 3 étapes :
+// Fetch les listes utilisateur via le sidecar TV Time.
+// Endpoint : GET sidecar?o_b64=BASE64(msapi …/v2/lists/user/{userId}/lists)&expand=meta
+// Retourne un tableau brut de listes (chacune avec objects[]).
+// ---------------------------------------------------------------------------
+async function fetchListsViaTab(tabId, userId) {
+  const innerUrl   = `https://msapi.tvtime.com/prod/v2/lists/user/${userId}`;
+  const b64        = btoa(innerUrl).replace(/=/g, "");
+  const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world:  "MAIN",
+    func: async (url) => {
+      try {
+        const decodedInner = atob(url.split("o_b64=")[1]?.split("&")[0] ?? "");
+        console.error("[TVTO] lists sidecarUrl:", url);
+        console.error("[TVTO] lists innerUrl decoded:", decodedInner);
+        const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
+        const r    = await fetch(url, {
+          credentials: "include",
+          headers: {
+            "Authorization":  "Bearer " + token,
+            "App-Version":    "2025082201",
+            "Client-Version": "10.10.0"
+          }
+        });
+        console.error("[TVTO] lists HTTP status:", r.status);
+        const text = await r.text();
+        console.error("[TVTO] lists raw response:", text.substring(0, 200));
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (e) {
+          return { error: e.message, rawStart: text.slice(0, 150) };
+        }
+        return { data };
+      } catch (e) {
+        return { error: e.message };
+      }
+    },
+    args: [sidecarUrl]
+  });
+
+  const result = results?.[0]?.result;
+  if (result?.error) {
+    if (result.rawStart !== undefined) {
+      console.error("[TVTO] fetchListsViaTab JSON parse error:", result.error, "— raw start:", result.rawStart);
+    }
+    throw new Error(result.error);
+  }
+  const raw = result?.data;
+  if (Array.isArray(raw))       return raw;
+  if (Array.isArray(raw?.data)) return raw.data;
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// Export 4 étapes :
 //   1. Shows follows (series + anime)
 //   2. Watch history (épisodes + films)
 //   3. Détails saisons par série (api2.tozelabs.com)
+//   4. Listes utilisateur (msapi.tvtime.com/prod/v2/lists)
 //
 // Films : follows/movie pour métadonnées (title, tvdb, imdb) + vus ET non vus
 //         watches/movie pour watched_at — fusion par UUID
 //
-// Produit 2 fichiers au format TV Time Liberator : shows + movies.
+// Produit 3 fichiers au format TV Time Liberator : shows + movies + lists.
 // ---------------------------------------------------------------------------
 async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
@@ -268,7 +326,7 @@ async function runExport(userId, token, tabId) {
     // -------------------------------------------------------------------------
     // Étape 1 — Séries + animés suivis
     // -------------------------------------------------------------------------
-    exportState.step      = "Step 1/3: Fetching your shows…";
+    exportState.step      = "Step 1/4: Fetching your shows...";
     exportState.stepIndex = 1;
     exportState.pct       = null;
 
@@ -286,7 +344,7 @@ async function runExport(userId, token, tabId) {
     // Étape 2 — Historique de visionnage (épisodes + films)
     // Les watches films contiennent déjà toutes les métadonnées (title, id.tvdb, id.imdb)
     // -------------------------------------------------------------------------
-    exportState.step      = "Step 2/3: Fetching watch history…";
+    exportState.step      = "Step 2/4: Fetching watch history...";
     exportState.stepIndex = 2;
 
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
@@ -306,7 +364,7 @@ async function runExport(userId, token, tabId) {
     // Batch parallèle de 5, timeout individuel (10s) + timeout batch (15s).
     // Pas de retry — évite les blocages du service worker MV3.
     // -------------------------------------------------------------------------
-    exportState.step      = `Step 3/3: Fetching episode details… (0/${showsRaw.length})`;
+    exportState.step      = `Step 3/4: Fetching episode details... (0/${showsRaw.length})`;
     exportState.stepIndex = 3;
 
     const BATCH_SIZE   = 3;
@@ -344,23 +402,25 @@ async function runExport(userId, token, tabId) {
       if (i % 15 === 0) {
         const pct = 30 + Math.round((i / showsNeedingSeasons.length) * 70);
         exportState.pct  = pct;
-        exportState.step = `Step 3/3: Fetching episode details… (${i + 1}/${showsNeedingSeasons.length})`;
+        exportState.step = `Step 3/4: Fetching episode details... (${i + 1}/${showsNeedingSeasons.length})`;
       }
     }
 
-    // Retry des séries échouées — jusqu'à 3 tentatives supplémentaires
-    let retryList = failedShows
+    // Retry des séries échouées —
+    // Au moins 50 tentatives garanties, puis arrêt si 10 rounds consécutifs sans amélioration.
+    let retryList          = failedShows
       .map(f => showsNeedingSeasons.find(s => s.tvdbId === f.tvdbId))
       .filter(Boolean);
 
-    const MAX_RETRIES = 25;
-    let attempt = 0;
+    let totalAttempts      = 0;
+    let noImprovementCount = 0;
+    let totalRecovered     = 0;
 
-    while (retryList.length > 0 && attempt < MAX_RETRIES) {
-      attempt++;
-      exportState.step = `⏳ Retrying ${retryList.length} failed series... (attempt ${attempt}/${MAX_RETRIES})`;
+    while (retryList.length > 0) {
+      const before = retryList.length;
+      exportState.step = `⏳ Retrying ${before} failed series... (attempt ${totalAttempts + 1}, recovered ${totalRecovered} so far)`;
+
       const stillFailed = [];
-
       for (let i = 0; i < retryList.length; i += BATCH_SIZE) {
         const batch = retryList.slice(i, i + BATCH_SIZE);
         const results = await Promise.allSettled(
@@ -381,7 +441,18 @@ async function runExport(userId, token, tabId) {
           }
         });
       }
+
       retryList = stillFailed;
+      totalAttempts++;
+
+      if (retryList.length < before) {
+        totalRecovered     += before - retryList.length;
+        noImprovementCount  = 0;
+      } else {
+        noImprovementCount++;
+      }
+
+      if (totalAttempts >= 50 && noImprovementCount >= 10) break;
     }
 
     const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));
@@ -396,7 +467,7 @@ async function runExport(userId, token, tabId) {
       id:         { tvdb: show.meta?.id ?? null, imdb: null },
       created_at: show.created_at                     ?? null,
       title:      show.meta?.name ?? show.meta?.title ?? null,
-      status:     show.meta?.is_ended ? "ended" : "up_to_date",
+      status:     show.filter?.[1] ?? "unknown",
       seasons:    (show.seasons ?? []).map(season => ({
         number:      season.number,
         is_specials: season.number === 0,
@@ -435,7 +506,44 @@ async function runExport(userId, token, tabId) {
       .filter(m => m.title === null)
       .map(m => ({ uuid: m.uuid, title: null }));
 
-    const result = { shows, movies, failedShows: finalFailed, failedMovies, durationMs: Date.now() - exportStartTime };
+    // -------------------------------------------------------------------------
+    // Étape 4 — Listes utilisateur
+    // -------------------------------------------------------------------------
+    exportState.step      = "Step 4/4: Fetching your lists...";
+    exportState.stepIndex = 4;
+
+    let listsRaw = [];
+    try {
+      listsRaw = await fetchListsViaTab(tabId, userId);
+    } catch (listsErr) {
+      console.error("[TVTO BG] fetchListsViaTab failed (non-fatal):", listsErr.message);
+    }
+
+    const lists = listsRaw.map(list => ({
+      id:          list.id          ?? null,
+      name:        list.name        ?? null,
+      description: list.description ?? "",
+      is_public:   list.is_public   ?? false,
+      created_at:  list.created_at  ?? null,
+      items: (list.objects ?? []).map((obj, idx) => {
+        if (obj.type === "series") {
+          return {
+            type:         "series",
+            tvdb_id:      obj.id   ?? null,
+            name:         obj.name ?? null,
+            custom_order: obj.custom_order ?? idx
+          };
+        }
+        return {
+          type:         "movie",
+          uuid:         obj.uuid ?? null,
+          name:         obj.name ?? null,
+          custom_order: obj.custom_order ?? idx
+        };
+      })
+    }));
+
+    const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, durationMs: Date.now() - exportStartTime };
 
     exportState = {
       status: "done",
