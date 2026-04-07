@@ -351,13 +351,13 @@ async function runExport(userId, token, tabId) {
 
     exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps fetched`;
 
-    // Index watched_at par episode_id — clés normalisées en String pour éviter type mismatch
-    const watchedAtMap = new Map(
-      episodeWatches.map(w => [String(w.episode_id), {
-        watched_at:    w.watched_at    ?? null,
-        rewatch_count: w.rewatch_count ?? 0
-      }])
-    );
+    // Index watched_at — double clé (episode_id, uuid) pour couvrir tous les formats
+    const watchedAtMap = new Map();
+    episodeWatches.forEach(w => {
+      const entry = { watched_at: w.watched_at ?? null, rewatch_count: w.rewatch_count ?? 0 };
+      if (w.episode_id) watchedAtMap.set(String(w.episode_id), entry);
+      if (w.uuid)       watchedAtMap.set(String(w.uuid),       entry);
+    });
 
     // -------------------------------------------------------------------------
     // Étape 3 — Détails saisons/épisodes par série
@@ -475,7 +475,7 @@ async function runExport(userId, token, tabId) {
           id:         { tvdb: ep.id ?? null, imdb: null },
           number:     ep.number,
           special:    ep.is_special ?? (season.number === 0),
-          is_watched:    ep.is_watched ?? false,
+          is_watched:    watchedAtMap.has(String(ep.id?.tvdb ?? ep.id)) || (ep.is_watched ?? false),
           watched_at:    formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.watched_at),
           rewatch_count: watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.rewatch_count ?? 0
         }))
