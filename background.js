@@ -13,6 +13,8 @@
  *   { type: "EXPORT_PROGRESS" }                        → polling depuis popup.js
  */
 
+import { buildSummaryHtml } from './exporter.js';
+
 // ---------------------------------------------------------------------------
 // État interne du service worker
 // ---------------------------------------------------------------------------
@@ -333,6 +335,7 @@ async function runExport(userId, token, tabId) {
     const seriesRaw = await fetchObjectsViaTab(tabId, cgwBase, "series", 1000);
     const animeRaw = await fetchObjectsViaTab(tabId, cgwBase, "anime", 1000);
 
+
     // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
     const moviesRaw = await fetchObjectsViaTab(tabId, cgwBase, "movie", 1000);
 
@@ -351,9 +354,17 @@ async function runExport(userId, token, tabId) {
 
     exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps fetched`;
 
+    // Filter episode watches to only include episodes from followed shows.
+    // This removes orphaned watch records for shows the user has unfollowed,
+    // which would otherwise appear as ghost watched episodes in the export.
+    const followedSeriesUuids = new Set(
+      [...seriesRaw, ...animeRaw].map(s => s.uuid).filter(Boolean)
+    );
+    const filteredWatches = episodeWatches.filter(w => followedSeriesUuids.has(w.series_uuid));
+
     // Index watched_at — double clé (episode_id, uuid) pour couvrir tous les formats
     const watchedAtMap = new Map();
-    episodeWatches.forEach(w => {
+    filteredWatches.forEach(w => {
       const entry = { watched_at: w.watched_at ?? null, rewatch_count: w.rewatch_count ?? 0 };
       if (w.episode_id) watchedAtMap.set(String(w.episode_id), entry);
       if (w.uuid)       watchedAtMap.set(String(w.uuid),       entry);
@@ -457,23 +468,74 @@ async function runExport(userId, token, tabId) {
 
     const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));
 
+    // ── Retry shows that came back with 0 episodes — up to 3 attempts, 90s each ─
+    // These shows fetched successfully but returned empty season data.
+    // Each show is retried sequentially (up to 3 times), stopping on first success.
+    // Shows that exhaust all retries are marked so the HTML summary can flag them.
+    const RETRY_TIMEOUT  = 90000;
+    const MAX_EP_RETRIES = 3;
+
+    const zeroEpShows = showsNeedingSeasons.filter(show => {
+      const seasons  = show._ref.seasons ?? [];
+      const totalEps = seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
+      return seasons.length === 0 || totalEps === 0;
+    });
+
+    // Set to track shows that failed all 3 retries (keyed by tvdbId)
+    const exhaustedRetries = new Set();
+
+    if (zeroEpShows.length > 0) {
+      exportState.step = `🔄 Retrying ${zeroEpShows.length} show(s) with no episode data (up to 3×90s)...`;
+
+      for (const show of zeroEpShows) {
+        let recovered = false;
+        for (let attempt = 1; attempt <= MAX_EP_RETRIES; attempt++) {
+          let value = null;
+          try {
+            value = await Promise.race([
+              fetchSingleViaTab(tabId, show.tvdbId),
+              new Promise(r => setTimeout(() => r(null), RETRY_TIMEOUT))
+            ]);
+          } catch (_) { value = null; }
+
+          if (value) {
+            const seasons  = value?.seasons ?? value?.data?.seasons ?? [];
+            const totalEps = seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
+            if (totalEps > 0) {
+              show._ref.seasons = seasons;
+              recovered = true;
+              break;
+            }
+          }
+        }
+        if (!recovered) exhaustedRetries.add(show.tvdbId);
+      }
+    }
+
     // -------------------------------------------------------------------------
     // Normalisation — Format TV Time Liberator
     // -------------------------------------------------------------------------
 
-    // Séries + animés → { uuid, id, created_at, title, status, seasons[] }
+    // Séries + animés → { uuid, id, created_at, title, status, is_followed, seasons[] }
     const shows = showsRaw.map(show => ({
-      uuid:       show.uuid                           ?? null,
-      id:         { tvdb: show.meta?.id ?? null, imdb: null },
-      created_at: show.created_at                     ?? null,
-      title:      show.meta?.name ?? show.meta?.title ?? null,
-      status:     show.filter?.[1] ?? "unknown",
+      uuid:             show.uuid                           ?? null,
+      id:               { tvdb: show.meta?.id ?? null, imdb: null },
+      created_at:       show.created_at                    ?? null,
+      title:            show.meta?.name ?? show.meta?.title ?? null,
+      status:           show.filter?.[1] ?? "unknown",
+      is_followed:      show.type === 'follow',
+      is_ended:         show.meta?.is_ended ?? false,
+      _noEpisodeData:   exhaustedRetries.has(show.meta?.id ?? null),
       seasons:    (show.seasons ?? []).map(season => ({
         number:      season.number,
         is_specials: season.number === 0,
-        episodes:    (season.episodes ?? []).map(ep => ({
+        episodes:    (season.episodes ?? []).filter(ep => {
+          const n = (ep.name ?? ep.title ?? "").trim();
+          return n.toUpperCase() !== "TBA";
+        }).map(ep => ({
           id:         { tvdb: ep.id ?? null, imdb: null },
           number:     ep.number,
+          name:       ep.name ?? ep.title ?? null,
           special:    ep.is_special ?? (season.number === 0),
           is_watched:    watchedAtMap.has(String(ep.id?.tvdb ?? ep.id)) || (ep.is_watched ?? false),
           watched_at:    formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.watched_at),
@@ -554,6 +616,15 @@ async function runExport(userId, token, tabId) {
       result,
       error:  null
     };
+
+    // Download HTML summary from background so it survives popup close
+    const htmlDate    = new Date().toISOString().split('T')[0];
+    const htmlContent = buildSummaryHtml(result.shows, result.movies, htmlDate);
+    chrome.downloads.download({
+      url:      'data:text/html;charset=utf-8,' + encodeURIComponent(htmlContent),
+      filename: `tvtime-summary-${htmlDate}.html`,
+      saveAs:   false
+    });
 
   } catch (err) {
     exportState = {
