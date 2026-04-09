@@ -183,6 +183,7 @@ function handleExportDone(state) {
 
   const r            = state?.result ?? {};
   const shows        = r.shows?.length        ?? 0;
+  const episodes     = r.watchedEpisodes      ?? 0;
   const movies       = r.movies?.length       ?? 0;
   const lists        = r.lists?.length        ?? 0;
   const failed       = r.failedShows?.length  ?? 0;
@@ -221,7 +222,7 @@ function handleExportDone(state) {
     const durationS = r.durationMs ? Math.round(r.durationMs / 1000) : null;
     const parts = [];
     if (durationS !== null) parts.push(`${durationS}s`);
-    if (shows)  parts.push(`${shows} shows 📺`);
+    if (shows)  parts.push(`${shows} shows & ${episodes.toLocaleString()} eps 📺`);
     if (movies) parts.push(`${movies} movies 📽️`);
     if (lists)  parts.push(`${lists} lists 📋`);
     const summaryStr = parts.length ? ` (${parts.join(" · ")})` : "";

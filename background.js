@@ -88,7 +88,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
 
-        exportState = { status: "running", step: "Step 1/4: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
+        exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
         sendResponse({ ok: true });
 
         runExport(userId, token, tabs[0].id);
@@ -265,9 +265,6 @@ async function fetchListsViaTab(tabId, userId) {
     world:  "MAIN",
     func: async (url) => {
       try {
-        const decodedInner = atob(url.split("o_b64=")[1]?.split("&")[0] ?? "");
-        console.error("[TVTO] lists sidecarUrl:", url);
-        console.error("[TVTO] lists innerUrl decoded:", decodedInner);
         const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
         const r    = await fetch(url, {
           credentials: "include",
@@ -277,9 +274,7 @@ async function fetchListsViaTab(tabId, userId) {
             "Client-Version": "10.10.0"
           }
         });
-        console.error("[TVTO] lists HTTP status:", r.status);
         const text = await r.text();
-        console.error("[TVTO] lists raw response:", text.substring(0, 200));
         let data;
         try {
           data = JSON.parse(text);
@@ -308,11 +303,50 @@ async function fetchListsViaTab(tabId, userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Export 4 étapes :
+// Fetch les détails d'un film via le sidecar TV Time.
+// Endpoint : GET sidecar?o_b64=BASE64(msapi …/v1/movies/{uuid})&random=true
+// Retourne le JSON brut de la réponse, ou null en cas d'erreur/timeout.
+// ---------------------------------------------------------------------------
+async function fetchMovieDetailViaTab(tabId, uuid) {
+  const innerUrl   = `https://msapi.tvtime.com/prod/v1/movies/${uuid}`;
+  const b64        = btoa(innerUrl).replace(/=/g, "");
+  const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    world:  "MAIN",
+    func: async (url) => {
+      try {
+        const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
+        const r = await fetch(url, {
+          credentials: "include",
+          headers: {
+            "Authorization":  "Bearer " + token,
+            "App-Version":    "2025082201",
+            "Client-Version": "10.10.0"
+          }
+        });
+        const data = await r.json();
+        return { data };
+      } catch (e) {
+        return { error: e.message };
+      }
+    },
+    args: [sidecarUrl]
+  });
+
+  const result = results?.[0]?.result;
+  if (!result || result.error) return null;
+  return result.data ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Export 5 étapes :
 //   1. Shows follows (series + anime)
 //   2. Watch history (épisodes + films)
 //   3. Détails saisons par série (api2.tozelabs.com)
-//   4. Listes utilisateur (msapi.tvtime.com/prod/v2/lists)
+//   4. Détails films (msapi.tvtime.com/prod/v1/movies)
+//   5. Listes utilisateur (msapi.tvtime.com/prod/v2/lists)
 //
 // Films : follows/movie pour métadonnées (title, tvdb, imdb) + vus ET non vus
 //         watches/movie pour watched_at — fusion par UUID
@@ -328,16 +362,25 @@ async function runExport(userId, token, tabId) {
     // -------------------------------------------------------------------------
     // Étape 1 — Séries + animés suivis
     // -------------------------------------------------------------------------
-    exportState.step      = "Step 1/4: Fetching your shows...";
+    exportState.step      = "Step 1/5: Fetching your shows...";
     exportState.stepIndex = 1;
     exportState.pct       = null;
 
-    const seriesRaw = await fetchObjectsViaTab(tabId, cgwBase, "series", 1000);
-    const animeRaw = await fetchObjectsViaTab(tabId, cgwBase, "anime", 1000);
+    // Fetch avec retry sur résultat vide — jusqu'à 3 tentatives, délai 2s entre chaque.
+    async function fetchWithRetry(entityType, pageLimit, maxRetries = 3) {
+      let results = await fetchObjectsViaTab(tabId, cgwBase, entityType, pageLimit);
+      for (let attempt = 1; attempt < maxRetries && results.length === 0; attempt++) {
+        await sleep(2000);
+        results = await fetchObjectsViaTab(tabId, cgwBase, entityType, pageLimit);
+      }
+      return results;
+    }
 
+    const seriesRaw = await fetchWithRetry("series", 1000);
+    const animeRaw  = await fetchWithRetry("anime",  1000);
 
     // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
-    const moviesRaw = await fetchObjectsViaTab(tabId, cgwBase, "movie", 1000);
+    const moviesRaw = await fetchWithRetry("movie", 1000);
 
     const showsRaw = [...seriesRaw, ...animeRaw];
     exportState.loaded     = showsRaw.length;
@@ -347,12 +390,10 @@ async function runExport(userId, token, tabId) {
     // Étape 2 — Historique de visionnage (épisodes + films)
     // Les watches films contiennent déjà toutes les métadonnées (title, id.tvdb, id.imdb)
     // -------------------------------------------------------------------------
-    exportState.step      = "Step 2/4: Fetching watch history...";
+    exportState.step      = "Step 2/5: Fetching watch history...";
     exportState.stepIndex = 2;
 
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
-
-    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${episodeWatches.length.toLocaleString()} eps fetched`;
 
     // Filter episode watches to only include episodes from followed shows.
     // This removes orphaned watch records for shows the user has unfollowed,
@@ -361,6 +402,8 @@ async function runExport(userId, token, tabId) {
       [...seriesRaw, ...animeRaw].map(s => s.uuid).filter(Boolean)
     );
     const filteredWatches = episodeWatches.filter(w => followedSeriesUuids.has(w.series_uuid));
+
+    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${filteredWatches.length.toLocaleString()} eps fetched`;
 
     // Index watched_at — double clé (episode_id, uuid) pour couvrir tous les formats
     const watchedAtMap = new Map();
@@ -375,7 +418,7 @@ async function runExport(userId, token, tabId) {
     // Batch parallèle de 5, timeout individuel (10s) + timeout batch (15s).
     // Pas de retry — évite les blocages du service worker MV3.
     // -------------------------------------------------------------------------
-    exportState.step      = `Step 3/4: Fetching episode details... (0/${showsRaw.length})`;
+    exportState.step      = `Step 3/5: Fetching episode details... (0/${showsRaw.length})`;
     exportState.stepIndex = 3;
 
     const BATCH_SIZE   = 3;
@@ -413,7 +456,7 @@ async function runExport(userId, token, tabId) {
       if (i % 15 === 0) {
         const pct = 30 + Math.round((i / showsNeedingSeasons.length) * 70);
         exportState.pct  = pct;
-        exportState.step = `Step 3/4: Fetching episode details... (${i + 1}/${showsNeedingSeasons.length})`;
+        exportState.step = `Step 3/5: Fetching episode details... (${i + 1}/${showsNeedingSeasons.length})`;
       }
     }
 
@@ -558,6 +601,7 @@ async function runExport(userId, token, tabId) {
         uuid:       m.uuid,
         created_at: m.created_at,
         title,
+        year:          null, // populated in Step 4/5
         watched_at:    m.watched_at ?? null,
         is_watched:    m.extended?.is_watched ?? meta?.is_watched ?? false,
         rewatch_count: m.rewatch_count ?? 0
@@ -569,9 +613,87 @@ async function runExport(userId, token, tabId) {
       .map(m => ({ uuid: m.uuid, title: null }));
 
     // -------------------------------------------------------------------------
-    // Étape 4 — Listes utilisateur
+    // Étape 4 — Détails films (first_release_date → year)
+    // Batch parallèle de 5. Retry jusqu'à 50 rounds min, arrêt si 10 rounds
+    // consécutifs sans amélioration (même logique que les détails séries).
     // -------------------------------------------------------------------------
-    exportState.step      = "Step 4/4: Fetching your lists...";
+    exportState.step      = `Step 4/5: Fetching movie details... (0/${movies.length})`;
+    exportState.stepIndex = 4;
+
+    const MOVIE_BATCH   = 5;
+    const MOVIE_TIMEOUT = 30000;
+    const movieYearMap  = new Map(); // uuid → year (number)
+
+    const moviesWithUuid = movies.filter(m => m.uuid);
+
+    // Initial pass
+    let movieRetryList = [];
+    for (let i = 0; i < moviesWithUuid.length; i += MOVIE_BATCH) {
+      const batch   = moviesWithUuid.slice(i, i + MOVIE_BATCH);
+      const results = await Promise.allSettled(
+        batch.map(m =>
+          Promise.race([
+            fetchMovieDetailViaTab(tabId, m.uuid),
+            new Promise(r => setTimeout(() => r(null), MOVIE_TIMEOUT))
+          ])
+        )
+      );
+      results.forEach((res, j) => {
+        const movie = batch[j];
+        const data  = res.status === "fulfilled" ? res.value : null;
+        if (data) {
+          const releaseDate = data?.first_release_date ?? data?.data?.first_release_date ?? null;
+          if (releaseDate) movieYearMap.set(movie.uuid, new Date(releaseDate).getFullYear());
+        } else {
+          movieRetryList.push(movie);
+        }
+      });
+      exportState.step = `Step 4/5: Fetching movie details... (${Math.min(i + MOVIE_BATCH, moviesWithUuid.length)}/${moviesWithUuid.length})`;
+    }
+
+    // Retry loop
+    let mAttempts = 0, mNoImprove = 0, mRecovered = 0;
+    while (movieRetryList.length > 0) {
+      const before = movieRetryList.length;
+      exportState.step = `⏳ Retrying ${before} failed movie details... (attempt ${mAttempts + 1}, recovered ${mRecovered} so far)`;
+
+      const stillFailed = [];
+      for (let i = 0; i < movieRetryList.length; i += MOVIE_BATCH) {
+        const batch   = movieRetryList.slice(i, i + MOVIE_BATCH);
+        const results = await Promise.allSettled(
+          batch.map(m =>
+            Promise.race([
+              fetchMovieDetailViaTab(tabId, m.uuid),
+              new Promise(r => setTimeout(() => r(null), MOVIE_TIMEOUT))
+            ])
+          )
+        );
+        results.forEach((res, j) => {
+          const movie = batch[j];
+          const data  = res.status === "fulfilled" ? res.value : null;
+          if (data) {
+            const releaseDate = data?.first_release_date ?? data?.data?.first_release_date ?? null;
+            if (releaseDate) movieYearMap.set(movie.uuid, new Date(releaseDate).getFullYear());
+          } else {
+            stillFailed.push(movie);
+          }
+        });
+      }
+
+      movieRetryList = stillFailed;
+      mAttempts++;
+      if (movieRetryList.length < before) { mRecovered += before - movieRetryList.length; mNoImprove = 0; }
+      else mNoImprove++;
+      if (mAttempts >= 50 && mNoImprove >= 10) break;
+    }
+
+    // Apply years to movie objects
+    movies.forEach(m => { m.year = movieYearMap.get(m.uuid) ?? null; });
+
+    // -------------------------------------------------------------------------
+    // Étape 5 — Listes utilisateur
+    // -------------------------------------------------------------------------
+    exportState.step      = "Step 5/5: Fetching your lists...";
     exportState.stepIndex = 4;
 
     let listsRaw = [];
@@ -605,7 +727,14 @@ async function runExport(userId, token, tabId) {
       })
     }));
 
-    const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, durationMs: Date.now() - exportStartTime };
+    const watchedEpisodes = shows.reduce((acc, show) =>
+      acc + (show.seasons ?? []).reduce((sacc, season) => {
+        if (season.number === 0) return sacc; // skip specials
+        return sacc + (season.episodes ?? []).filter(ep => ep.is_watched && !ep.special).length;
+      }, 0)
+    , 0);
+
+    const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime };
 
     exportState = {
       status: "done",

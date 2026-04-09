@@ -72,16 +72,16 @@ function buildSeriesCsv(shows) {
 
 function buildEpisodesCsv(shows) {
   const header = [
-    "show_uuid", "show_title", "season_number", "episode_number",
-    "episode_tvdb_id", "is_special", "is_watched", "watched_at", "rewatch_count"
+    "series_tvdb_id", "series_imdb_id", "series_uuid", "title",
+    "season", "episode", "tvdb_id", "is_watched", "watched_at", "rewatch_count", "special"
   ];
   const rows = [];
   for (const show of shows) {
     for (const season of (show.seasons ?? [])) {
       for (const ep of (season.episodes ?? [])) {
         rows.push([
-          show.uuid, show.title, season.number, ep.number,
-          ep.id?.tvdb, ep.special, ep.is_watched, ep.watched_at, ep.rewatch_count
+          show.id?.tvdb, show.id?.imdb, show.uuid, show.title,
+          season.number, ep.number, ep.id?.tvdb, ep.is_watched, ep.watched_at, ep.rewatch_count, ep.special
         ]);
       }
     }
@@ -91,11 +91,11 @@ function buildEpisodesCsv(shows) {
 
 function buildMoviesCsv(movies) {
   const header = [
-    "uuid", "tvdb_id", "imdb_id", "title", "created_at",
+    "uuid", "tvdb_id", "imdb_id", "title", "year", "created_at",
     "watched_at", "is_watched", "rewatch_count"
   ];
   const rows = movies.map(m => [
-    m.uuid, m.id?.tvdb, m.id?.imdb, m.title, m.created_at,
+    m.uuid, m.id?.tvdb, m.id?.imdb, m.title, m.year, m.created_at,
     m.watched_at, m.is_watched, m.rewatch_count
   ]);
   return toCsvBlob([header, ...rows]);
@@ -333,6 +333,14 @@ export function buildSummaryHtml(shows, movies, date) {
 
   const totalEpsWatched = showData.reduce((acc, r) => acc + r.watched + r.watchedSpecials, 0);
 
+  // ── Summary statistics (shows only — movie stats computed after movieData) ──
+  const totalShowsFollowed      = showData.filter(s => s.isFollowed !== false).length;
+  const totalRegularWatched     = showData.reduce((acc, s) => acc + s.watched, 0);
+  const totalRegularNoDate      = showData.reduce((acc, s) => acc + s.watchedNoDate, 0);
+  const totalRegularWithDate    = totalRegularWatched - totalRegularNoDate;
+  const regularDatePct          = totalRegularWatched > 0 ? Math.round((totalRegularWithDate / totalRegularWatched) * 100) : 0;
+  const totalSpecialsWatched    = showData.reduce((acc, s) => acc + s.watchedSpecials, 0);
+
   // ── Pre-compute movie data ─────────────────────────────────────────────────
   const movieData = movieList.map(movie => {
     const tvdbId = movie.id?.tvdb ?? null;
@@ -343,6 +351,7 @@ export function buildSummaryHtml(shows, movies, date) {
       tvdbId,
       imdbId,
       uuid,
+      year:         movie.year          ?? null,
       isWatched:    movie.is_watched    ?? false,
       watchedAt:    movie.watched_at    ?? null,
       rewatchCount: movie.rewatch_count ?? 0,
@@ -352,6 +361,12 @@ export function buildSummaryHtml(shows, movies, date) {
       imdbHref:     imdbId ? "https://www.imdb.com/title/"      + imdbId : null
     };
   });
+
+  // ── Summary statistics (movies) ───────────────────────────────────────────
+  const totalMoviesWatched      = movieData.filter(m => m.isWatched).length;
+  const totalMoviesWithDate     = movieData.filter(m => m.isWatched && m.watchedAt).length;
+  const totalMoviesNoDate       = totalMoviesWatched - totalMoviesWithDate;
+  const movieDatePct            = totalMoviesWatched > 0 ? Math.round((totalMoviesWithDate / totalMoviesWatched) * 100) : 0;
 
   // Movies table stays static HTML (sort/filter not requested for movies)
   const movieRowsHtml = movieData.map(movie => {
@@ -364,7 +379,7 @@ export function buildSummaryHtml(shows, movies, date) {
     const rewatchBadge = movie.rewatchCount > 0
       ? ` <span class="badge">${movie.rewatchCount}\u00D7</span>` : "";
     return `    <tr${movie.rowClass ? ` class="${movie.rowClass}"` : ""}>
-      <td class="td-title">${escapeHtml(movie.title)}${linksHtml}</td>
+      <td class="td-title">${escapeHtml(movie.title)}${movie.year ? `<span class="year-badge">(${movie.year})</span>` : ""}${linksHtml}</td>
       <td class="td-id">${movie.tvdbId != null ? escapeHtml(String(movie.tvdbId)) : '<span class="na">\u2014</span>'}</td>
       <td class="td-id">${movie.imdbId ? escapeHtml(movie.imdbId) : '<span class="na">\u2014</span>'}</td>
       <td class="td-status">${movie.isWatched ? "Yes" : "No"}</td>
@@ -417,6 +432,19 @@ export function buildSummaryHtml(shows, movies, date) {
       padding: 12px 16px; font-size: 13px; color: #ccc; line-height: 1.6;
     }
     .notice strong { color: #c084fc; display: block; margin-bottom: 4px; font-size: 13px; }
+
+    /* ── Summary statistics block ───────────────────────────────────────── */
+    .summary-stats {
+      max-width: 1200px; margin: 0 auto 20px;
+      background: rgba(245,197,24,.06); border: 1px solid rgba(245,197,24,.25);
+      border-left: 4px solid #f5c518; border-radius: 6px;
+      padding: 12px 16px; font-size: 12px; color: #ccc; line-height: 1.8;
+    }
+    .summary-stats .ss-section { margin-bottom: 4px; }
+    .summary-stats .ss-section:last-child { margin-bottom: 0; }
+    .summary-stats .ss-label { font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #888; margin-right: 6px; }
+    .summary-stats .ss-hi { color: #f5c518; font-weight: 600; }
+    .summary-stats .ss-dim { color: #888; }
 
     /* ── Legend ─────────────────────────────────────────────────────────── */
     .legend {
@@ -483,6 +511,7 @@ export function buildSummaryHtml(shows, movies, date) {
 
     /* ── Column classes ──────────────────────────────────────────────────── */
     .td-title   { width: 220px; color: #fff; overflow: hidden; }
+    .year-badge { font-size: 10px; color: #888; font-weight: 400; margin-left: 3px; white-space: nowrap; }
     .td-id      { font-size: 12px; color: #666; overflow: hidden; font-family: monospace; }
     .td-status  { color: #bbb; overflow: hidden; }
     .td-eps     { overflow: hidden; }
@@ -562,6 +591,22 @@ export function buildSummaryHtml(shows, movies, date) {
   <div class="notice">
     <strong>&#9888;&#65039; Data Accuracy Notice</strong>
     This export is based on TV Time's API and may contain inaccuracies due to known TV Time backend issues: orphaned watch records for shows you never watched, episodes marked as watched without a date, very old watches (pre-2017) that may not appear in the API, and ghost data that TV Time never cleaned up. Always cross-check outliers against your TV Time profile before importing elsewhere.
+    Watch dates are stored in UTC by TV Time. If you notice some dates appearing 1 day off, this is expected — it happens when episodes were marked as watched late at night in your local timezone.
+  </div>
+
+  <div class="summary-stats">
+    <div class="ss-section">
+      <span class="ss-label">Shows</span>
+      <span class="ss-hi">${totalShowsFollowed.toLocaleString()}</span> followed &nbsp;&middot;&nbsp;
+      <span class="ss-hi">${totalRegularWatched.toLocaleString()}</span> regular episodes watched
+      <span class="ss-dim">(${totalRegularWithDate.toLocaleString()} with date &nbsp;&middot;&nbsp; ${totalRegularNoDate.toLocaleString()} without date &nbsp;&middot;&nbsp; ${regularDatePct}% date coverage)</span>
+      &nbsp;&middot;&nbsp; <span class="ss-hi">${totalSpecialsWatched.toLocaleString()}</span> specials watched
+    </div>
+    <div class="ss-section">
+      <span class="ss-label">Movies</span>
+      <span class="ss-hi">${totalMoviesWatched.toLocaleString()}</span> watched
+      <span class="ss-dim">(${totalMoviesWithDate.toLocaleString()} with date &nbsp;&middot;&nbsp; ${totalMoviesNoDate.toLocaleString()} without date &nbsp;&middot;&nbsp; ${movieDatePct}% date coverage)</span>
+    </div>
   </div>
 
   <div class="legend">
@@ -751,7 +796,14 @@ ${movieRowsHtml}
           var key = order[oi];
           if (!issueEps[key]) continue;
           var epList = issueEps[key].map(fmtEp).join(' \u00b7 ');
-          parts.push(key + ':<br>' + epList);
+          var label;
+          if (key === 'Watched but no date') {
+            var cnt = issueEps[key].length;
+            label = cnt + ' episode' + (cnt > 1 ? 's' : '') + ' watched but no watch date';
+          } else {
+            label = key;
+          }
+          parts.push(label + ':<br>' + epList);
         }
       }
 
