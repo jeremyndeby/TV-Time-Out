@@ -88,10 +88,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
 
+        // Prefer fully-loaded, non-discarded tabs; fall back to any tab if none qualify.
+        const best = tabs.find(t => t.status === "complete" && !t.discarded) ?? tabs[0];
+
         exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
         sendResponse({ ok: true });
 
-        runExport(userId, token, tabs[0].id);
+        runExport(userId, token, best.id);
       });
       return true;
     }
@@ -421,8 +424,8 @@ async function runExport(userId, token, tabId) {
     exportState.step      = `Step 3/5: Fetching episode details... (0/${showsRaw.length})`;
     exportState.stepIndex = 3;
 
-    const BATCH_SIZE   = 3;
-    const SHOW_TIMEOUT = 60000;
+    const BATCH_SIZE   = 5;
+    const SHOW_TIMEOUT = 90000;
     const failedShows  = [];
 
     // Pré-calcul : liste plate des shows avec leur tvdbId et title
@@ -472,6 +475,24 @@ async function runExport(userId, token, tabId) {
 
     while (retryList.length > 0) {
       const before = retryList.length;
+
+      // Refresh JWT token at the start of each retry round — long exports can
+      // outlast the token's lifetime; re-reading from localStorage picks up any
+      // token the TV Time app has already renewed automatically.
+      try {
+        const freshTokenResult = await chrome.scripting.executeScript({
+          target: { tabId },
+          world:  "MAIN",
+          func:   () => localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "")
+        });
+        const freshToken = freshTokenResult?.[0]?.result;
+        if (freshToken) {
+          token = freshToken;
+          cachedCredentials = { ...cachedCredentials, token: freshToken };
+          chrome.storage.session.set({ credentials: cachedCredentials });
+        }
+      } catch (_) { /* non-fatal — keep using the last known token */ }
+
       exportState.step = `⏳ Retrying ${before} failed series... (attempt ${totalAttempts + 1}, recovered ${totalRecovered} so far)`;
 
       const stillFailed = [];
@@ -506,7 +527,7 @@ async function runExport(userId, token, tabId) {
         noImprovementCount++;
       }
 
-      if (totalAttempts >= 50 && noImprovementCount >= 10) break;
+      if (totalAttempts >= 100 && noImprovementCount >= 20) break;
     }
 
     const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));

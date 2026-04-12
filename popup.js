@@ -58,19 +58,24 @@ function hideProgress() {
   currentProgress = 0;
 }
 
-function startTimer() {
-  stopTimer();
-  startTime = Date.now();
-  elapsedEl.textContent = "0s elapsed";
+function startElapsedInterval() {
   elapsedInterval = setInterval(() => {
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     elapsedEl.textContent = `${elapsed}s elapsed`;
   }, 1000);
 }
 
-function stopTimer() {
+function startTimer() {
+  stopTimer(false);
+  startTime = Date.now();
+  elapsedEl.textContent = "0s elapsed";
+  startElapsedInterval();
+}
+
+function stopTimer(clearStorage = true) {
   if (elapsedInterval) { clearInterval(elapsedInterval); elapsedInterval = null; }
   startTime = null;
+  if (clearStorage) chrome.storage.local.remove("exportStartTime");
 }
 
 function resetToIdle() {
@@ -117,47 +122,67 @@ function sendMsg(msg) {
 // ---------------------------------------------------------------------------
 async function getCredentialsFromTab() {
   return new Promise((resolve) => {
-    chrome.tabs.query({ url: "https://app.tvtime.com/*" }, (tabs) => {
+    chrome.tabs.query({ url: "https://app.tvtime.com/*" }, async (tabs) => {
       if (!tabs?.length) { resolve(null); return; }
 
-      chrome.scripting.executeScript({
-        target: { tabId: tabs[0].id },
-        world:  "MAIN",
-        func: () => {
-          const rawToken = localStorage.getItem("flutter.jwtToken");
-          const token = rawToken ? rawToken.replace(/^"|"$/g, "") : null;
-          const rawUser = localStorage.getItem('flutter.user');
-          let userId = null;
-          // Tentative 1 : JSON.parse direct
-          try { userId = JSON.parse(rawUser)?.id; } catch(e) {}
-          // Tentative 2 : regex sur la string brute
-          if (!userId && rawUser) {
-            const m = rawUser.match(/"id"\s*:\s*"?(\d+)"?/);
-            if (m) userId = m[1];
-          }
-          // Tentative 3 : extraire depuis le JWT token lui-même
-          if (!userId && token) {
-            try {
-              const payload = JSON.parse(atob(token.split('.')[1]));
-              userId = payload.id || payload.sub;
-            } catch(e) {}
-          }
-          // Tentative 4 : URL fallback (ancien comportement)
-          if (!userId) {
-            const match = window.location.href.match(/:(\d{4,})/);
-            userId = match ? match[1] : null;
-          }
-          return { token, userId };
+      // Filter to tabs that are fully loaded and not discarded/suspended.
+      // executeScript fails silently on discarded or still-loading tabs even
+      // when the URL matches host_permissions, producing the misleading
+      // "Extension manifest must request permission" error.
+      const scriptableTabs = tabs.filter(t =>
+        t.status === "complete" && !t.discarded && t.url?.startsWith("https://app.tvtime.com/")
+      );
+
+      // Fallback: if nothing passes the filter, try all tabs anyway (user may
+      // be on a loading tab — better to attempt than to silently return null).
+      const candidates = scriptableTabs.length ? scriptableTabs : tabs;
+
+      const readFunc = () => {
+        const rawToken = localStorage.getItem("flutter.jwtToken");
+        const token = rawToken ? rawToken.replace(/^"|"$/g, "") : null;
+        const rawUser = localStorage.getItem('flutter.user');
+        let userId = null;
+        // Tentative 1 : JSON.parse direct
+        try { userId = JSON.parse(rawUser)?.id; } catch(e) {}
+        // Tentative 2 : regex sur la string brute
+        if (!userId && rawUser) {
+          const m = rawUser.match(/"id"\s*:\s*"?(\d+)"?/);
+          if (m) userId = m[1];
         }
-      }, (results) => {
-        if (chrome.runtime.lastError) {
-          console.error("[TVTO] executeScript error:", chrome.runtime.lastError.message);
-          resolve(null); return;
+        // Tentative 3 : extraire depuis le JWT token lui-même
+        if (!userId && token) {
+          try {
+            const payload = JSON.parse(atob(token.split('.')[1]));
+            userId = payload.id || payload.sub;
+          } catch(e) {}
         }
-        const result = results?.[0]?.result;
-        if (!result?.token) { resolve(null); return; }
-        resolve(result);
-      });
+        // Tentative 4 : URL fallback (ancien comportement)
+        if (!userId) {
+          const match = window.location.href.match(/:(\d{4,})/);
+          userId = match ? match[1] : null;
+        }
+        return { token, userId };
+      };
+
+      // Try each candidate tab in order; return on first success.
+      for (const tab of candidates) {
+        const result = await new Promise((res) => {
+          chrome.scripting.executeScript(
+            { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
+            (results) => {
+              if (chrome.runtime.lastError) {
+                console.warn("[TVTO] executeScript skipped tab", tab.id, "—", chrome.runtime.lastError.message);
+                res(null); return;
+              }
+              const r = results?.[0]?.result;
+              res(r?.token ? r : null);
+            }
+          );
+        });
+        if (result) { resolve(result); return; }
+      }
+
+      resolve(null);
     });
   });
 }
@@ -220,8 +245,10 @@ function handleExportDone(state) {
     // Update message after downloads are queued
     const fileCount = [shows, movies, lists].filter(Boolean).length + (failed > 0 ? 1 : 0) + (failedMovies > 0 ? 1 : 0);
     const durationS = r.durationMs ? Math.round(r.durationMs / 1000) : null;
+    const formatLabel = format === "both" ? "JSON+CSV" : format.toUpperCase();
     const parts = [];
     if (durationS !== null) parts.push(`${durationS}s`);
+    parts.push(formatLabel);
     if (shows)  parts.push(`${shows} shows & ${episodes.toLocaleString()} eps 📺`);
     if (movies) parts.push(`${movies} movies 📽️`);
     if (lists)  parts.push(`${lists} lists 📋`);
@@ -284,6 +311,11 @@ async function init() {
   document.getElementById('version-label').textContent =
     'v' + chrome.runtime.getManifest().version;
 
+  // Restore previously saved export format
+  chrome.storage.local.get("exportFormat", (data) => {
+    if (data.exportFormat) formatSelect.value = data.exportFormat;
+  });
+
   const credentials = await ensureCredentials();
 
   if (!credentials?.token || !credentials?.userId) {
@@ -299,8 +331,16 @@ async function init() {
   if (state.status === "running") {
     setStatus(state.step || "Fetching your data...", "running", true);
     btnExport.disabled = true;
-    startTimer();
-    startPolling();
+    chrome.storage.local.get(["exportStartTime"], (data) => {
+      stopTimer(false);
+      if (data.exportStartTime) {
+        startTime = data.exportStartTime;
+      } else {
+        startTime = Date.now();
+      }
+      startElapsedInterval();
+      startPolling();
+    });
     return;
   }
 
@@ -340,8 +380,16 @@ btnExport.addEventListener("click", async () => {
   setStatus("Starting export…", "running", true);
   btnExport.disabled = true;
   showProgress();
+  chrome.storage.local.set({ exportStartTime: Date.now() });
   startTimer();
   startPolling();
+});
+
+// ---------------------------------------------------------------------------
+// Format selector — persist choice across popup sessions
+// ---------------------------------------------------------------------------
+formatSelect.addEventListener("change", () => {
+  chrome.storage.local.set({ exportFormat: formatSelect.value });
 });
 
 // ---------------------------------------------------------------------------
