@@ -63,9 +63,9 @@ function toCsvBlob(rows) {
 }
 
 function buildSeriesCsv(shows) {
-  const header = ["uuid", "tvdb_id", "imdb_id", "title", "status", "is_followed", "created_at"];
+  const header = ["uuid", "tvdb_id", "imdb_id", "title", "status", "created_at"];
   const rows   = shows.map(s => [
-    s.uuid, s.id?.tvdb, s.id?.imdb, s.title, s.status, s.is_followed, s.created_at
+    s.uuid, s.id?.tvdb, s.id?.imdb, s.title, s.status, s.created_at
   ]);
   return toCsvBlob([header, ...rows]);
 }
@@ -251,8 +251,7 @@ export function buildSummaryHtml(shows, movies, date) {
   }
 
   // ── Row class ──────────────────────────────────────────────────────────────
-  function rowCls(status, watched, total, isFollowed) {
-    if (isFollowed === false)                          return "row-unfollowed";
+  function rowCls(status, watched, total) {
     if (total > 0 && watched === total)                return "row-green";
     if (status === "up_to_date" && watched < total)    return "row-red";
     if (watched === 0 && status !== "not_started_yet") return "row-orange";
@@ -288,8 +287,6 @@ export function buildSummaryHtml(shows, movies, date) {
     const pctSpecials      = totalSpecials > 0 ? Math.round((watchedSpecials / totalSpecials) * 100) : 0;
     const tvdbId           = show.id?.tvdb  ?? null;
     const imdbId           = show.id?.imdb  ?? null;
-    const isFollowed       = show.is_followed ?? true;
-    const isEnded          = show.is_ended   ?? false;
 
     // Show-level flags
     const ghostEntry      = allEpsTagged.length === 0;
@@ -307,8 +304,6 @@ export function buildSummaryHtml(shows, movies, date) {
       tvdbId,
       imdbId,
       status:             show.status ?? "",
-      isFollowed,
-      isEnded,
       watched,
       total,
       pct,
@@ -320,7 +315,7 @@ export function buildSummaryHtml(shows, movies, date) {
       noEpisodeData:      show._noEpisodeData ?? false,
       unwatchedRegularEps,
       watchedNoDate:      regularEps.filter(e => e.is_watched && !e.watched_at).length,
-      rowClass:           rowCls(show.status ?? "", watched, total, isFollowed),
+      rowClass:           rowCls(show.status ?? "", watched, total),
       tvtHref:            tvdbId ? "https://app.tvtime.com/series/"   + tvdbId : null,
       tvdbHref:           tvdbId ? "https://www.thetvdb.com/series/" + tvdbId : null,
       imdbHref:           imdbId ? "https://www.imdb.com/title/"     + imdbId : null,
@@ -334,7 +329,6 @@ export function buildSummaryHtml(shows, movies, date) {
   const totalEpsWatched = showData.reduce((acc, r) => acc + r.watched + r.watchedSpecials, 0);
 
   // ── Summary statistics (shows only — movie stats computed after movieData) ──
-  const totalShowsFollowed      = showData.filter(s => s.isFollowed !== false).length;
   const totalRegularWatched     = showData.reduce((acc, s) => acc + s.watched, 0);
   const totalRegularNoDate      = showData.reduce((acc, s) => acc + s.watchedNoDate, 0);
   const totalRegularWithDate    = totalRegularWatched - totalRegularNoDate;
@@ -398,7 +392,7 @@ export function buildSummaryHtml(shows, movies, date) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TV Time Out \u2014 Export Summary ${escapeHtml(date)}</title>
+  <title>TV Time Out by Refract \u2014 Export Summary ${escapeHtml(date)}</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -561,12 +555,9 @@ export function buildSummaryHtml(shows, movies, date) {
     tr.row-green      td { background: rgba( 34,197, 94,.09); }
     tr.row-red        td { background: rgba(239, 68, 68,.11); }
     tr.row-orange     td { background: rgba(249,115, 22,.09); }
-    tr.row-unfollowed td { background: rgba(128,128,128,.05); }
-    tr.row-unfollowed .td-title { color: #aaa; }
-    tr.row-green:hover      td { background: rgba( 34,197, 94,.16); }
-    tr.row-red:hover        td { background: rgba(239, 68, 68,.18); }
-    tr.row-orange:hover     td { background: rgba(249,115, 22,.16); }
-    tr.row-unfollowed:hover td { background: rgba(128,128,128,.10); }
+    tr.row-green:hover  td { background: rgba( 34,197, 94,.16); }
+    tr.row-red:hover    td { background: rgba(239, 68, 68,.18); }
+    tr.row-orange:hover td { background: rgba(249,115, 22,.16); }
 
     /* ── Issues + Notes columns ──────────────────────────────────────────── */
     .td-issues { text-align: center; overflow: hidden; }
@@ -606,7 +597,7 @@ export function buildSummaryHtml(shows, movies, date) {
 <body>
 
   <div class="header">
-    <h1>&#128250; TV Time Out \u2014 Export Summary</h1>
+    <h1>&#128250; <span style="color:#f5c518">TV TIME OUT</span> <span style="font-size:0.55em;color:#6b2d8b;letter-spacing:2px;vertical-align:middle;">BY REFRACT</span> \u2014 Export Summary</h1>
     <div class="stats">
       <div class="stat"><span class="stat-label">Export date</span><span class="stat-value">${escapeHtml(date)}</span></div>
       <div class="stat"><span class="stat-label">Shows</span><span class="stat-value">${showList.length.toLocaleString()}</span></div>
@@ -619,12 +610,13 @@ export function buildSummaryHtml(shows, movies, date) {
     <strong>&#9888;&#65039; Data Accuracy Notice</strong>
     This export is based on TV Time's API and may contain inaccuracies due to known TV Time backend issues: orphaned watch records for shows you never watched, episodes marked as watched without a date, very old watches (pre-2017) that may not appear in the API, and ghost data that TV Time never cleaned up. Always cross-check outliers against your TV Time profile before importing elsewhere.
     Watch dates are stored in UTC by TV Time. If you notice some dates appearing 1 day off, this is expected — it happens when episodes were marked as watched late at night in your local timezone.
+    Episode counts may include future unaired episodes that TV Time pre-creates in their database with real titles. This can cause "up-to-date but X episodes unwatched" warnings for continuing shows where the missing episodes haven't aired yet.
   </div>
 
   <div class="summary-stats">
     <div class="ss-section">
       <span class="ss-label">Shows</span>
-      <span class="ss-hi">${totalShowsFollowed.toLocaleString()}</span> followed &nbsp;&middot;&nbsp;
+      <span class="ss-hi">${showList.length.toLocaleString()}</span> total &nbsp;&middot;&nbsp;
       <span class="ss-hi">${totalRegularWatched.toLocaleString()}</span> regular episodes watched
       <span class="ss-dim">(${totalRegularWithDate.toLocaleString()} with date &nbsp;&middot;&nbsp; ${totalRegularNoDate.toLocaleString()} without date &nbsp;&middot;&nbsp; ${regularDatePct}% date coverage)</span>
       &nbsp;&middot;&nbsp; <span class="ss-hi">${totalSpecialsWatched.toLocaleString()}</span> specials watched
@@ -640,7 +632,6 @@ export function buildSummaryHtml(shows, movies, date) {
     <span><span class="legend-dot" style="background:rgba(34,197,94,.6)"></span>Fully caught up</span>
     <span><span class="legend-dot" style="background:rgba(239,68,68,.6)"></span>Marked up-to-date but missing episodes</span>
     <span><span class="legend-dot" style="background:rgba(249,115,22,.6)"></span>Following but 0 episodes watched</span>
-    <span><span class="legend-dot" style="background:rgba(128,128,128,.25)"></span>Not followed (in list only)</span>
     <span style="margin-left:8px; color:#6b2d8b">&#9654;</span><span style="color:#777; margin-left:4px">Episode data inconsistencies</span>
   </div>
 
@@ -652,10 +643,8 @@ export function buildSummaryHtml(shows, movies, date) {
         <tr>
           <th class="th-num" style="width:36px">#</th>
           <th class="sortable sort-asc" data-sortcol="0" onclick="sortBy(0)" style="width:220px">Title</th>
-          <th class="sortable" data-sortcol="7" onclick="sortBy(7)" style="width:80px">Type</th>
           <th class="sortable" data-sortcol="1" onclick="sortBy(1)" style="width:80px">TVDB ID</th>
           <th class="sortable" data-sortcol="2" onclick="sortBy(2)" style="width:80px">IMDb ID</th>
-          <th class="sortable" data-sortcol="3" onclick="sortBy(3)" style="width:70px">Followed</th>
           <th class="sortable" data-sortcol="4" onclick="sortBy(4)" style="width:110px">Status</th>
           <th class="sortable" data-sortcol="5" onclick="sortBy(5)" style="width:90px">Episodes</th>
           <th class="sortable" data-sortcol="6" onclick="sortBy(6)" style="width:80px">Specials</th>
@@ -666,10 +655,8 @@ export function buildSummaryHtml(shows, movies, date) {
         <tr class="filter-row">
           <th class="th-num"></th>
           <th><input class="col-filter" type="search" placeholder="Title\u2026" autocomplete="off" oninput="setFilter(0,this.value)"></th>
-          <th><select class="col-filter" onchange="setFilter(7,this.value)"><option value="">All</option><option value="ended">Ended</option><option value="continuing">Continuing</option></select></th>
           <th><input class="col-filter" type="search" placeholder="TVDB\u2026"  autocomplete="off" oninput="setFilter(1,this.value)"></th>
           <th><input class="col-filter" type="search" placeholder="IMDb\u2026"  autocomplete="off" oninput="setFilter(2,this.value)"></th>
-          <th><select class="col-filter" onchange="setFilter(3,this.value)"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select></th>
           <th><select class="col-filter" onchange="setFilter(4,this.value)"><option value="">All</option><option value="up_to_date">up_to_date</option><option value="continuing">continuing</option><option value="stopped">stopped</option><option value="not_started_yet">not_started_yet</option><option value="unknown">unknown</option></select></th>
           <th></th>
           <th></th>
@@ -724,6 +711,7 @@ ${items}
   })()}
 
   <p class="footer">Generated by <strong style="color:#f5c518">TV Time Out</strong> \u00B7 ${escapeHtml(date)}</p>
+  <p class="footer" style="margin-top:6px;">Have a suggestion or feedback? Share it with the <a href="https://getrefract.app/discord" target="_blank" style="color:#f5c518;text-decoration:none;">Refract community</a>!</p>
 
   <script>
     var SHOWS  = ${showsJson};
@@ -754,21 +742,17 @@ ${items}
                              vb = b.tvdbId != null ? Number(b.tvdbId) : Infinity; }
       else if (_col === 2) { va = (a.imdbId || '').trim().toLowerCase();
                              vb = (b.imdbId || '').trim().toLowerCase(); }
-      else if (_col === 3) { va = a.isFollowed === false ? 0 : 1;
-                             vb = b.isFollowed === false ? 0 : 1; }
       else if (_col === 4) { va = (a.status || '').toLowerCase();
                              vb = (b.status || '').toLowerCase(); }
       else if (_col === 5) { va = a.pct;        vb = b.pct; }
       else if (_col === 6) { va = a.pctSpecials; vb = b.pctSpecials; }
-      else if (_col === 7) { va = a.isEnded ? 1 : 0; vb = b.isEnded ? 1 : 0; }
       else if (_col === 8) {
         var _hasIssue = function(s) {
           return (s.flaggedEps && s.flaggedEps.length > 0) ||
                  (s.status === 'up_to_date' && s.total > 0 && s.watched < s.total) ||
                  (s.status === 'up_to_date' && s.watched === 0) ||
                  (s.watched > 0 && s.status === 'not_started_yet') ||
-                 (s.watched === s.total && s.total > 0 && s.status === 'stopped') ||
-                 (s.isFollowed === false && s.watched > 0);
+                 (s.watched === s.total && s.total > 0 && s.status === 'stopped');
         };
         va = _hasIssue(a) ? 1 : 0; vb = _hasIssue(b) ? 1 : 0;
       }
@@ -792,17 +776,9 @@ ${items}
       if (_filters[0] && s.title.toLowerCase().indexOf(_filters[0]) === -1) return true;
       if (_filters[1] && String(s.tvdbId ?? '').indexOf(_filters[1]) === -1) return true;
       if (_filters[2] && (s.imdbId || '').toLowerCase().indexOf(_filters[2]) === -1) return true;
-      if (_filters[3]) {
-        var fol = s.isFollowed === false ? 'no' : 'yes';
-        if (fol.indexOf(_filters[3]) === -1) return true;
-      }
       if (_filters[4] && (s.status || '').toLowerCase().indexOf(_filters[4]) === -1) return true;
       if (_filters[5] && (s.watched + '\/' + s.total).indexOf(_filters[5]) === -1) return true;
       if (_filters[6] && (s.watchedSpecials + '\/' + s.totalSpecials).indexOf(_filters[6]) === -1) return true;
-      if (_filters[7]) {
-        var endedVal = s.isEnded ? 'ended' : 'continuing';
-        if (endedVal !== _filters[7]) return true;
-      }
       if (_filters[8]) {
         var hasNoDate = s.watchedNoDate > 0;
         if (_filters[8] === 'yes' && !hasNoDate) return true;
@@ -877,9 +853,6 @@ ${items}
       if (s.watched === s.total && s.total > 0 && s.status === 'stopped') {
         parts.push('All episodes watched but marked as stopped');
       }
-      if (s.isFollowed === false && s.watched > 0) {
-        parts.push('Has watched episodes but not followed');
-      }
 
       return parts.join(' \u00b7 ');
     }
@@ -911,11 +884,6 @@ ${items}
         var showBadges = '';
         if (s.allMissingDates) showBadges += ' <span class="flag-badge flag-nodate">no dates<\/span>';
 
-        // Followed cell
-        var followedCell = s.isFollowed === false
-          ? '<span style="color:#666">No<\/span>'
-          : 'Yes';
-
         // Specials cell (purple, em-dash when none)
         var specialsCell = s.totalSpecials > 0
           ? s.watchedSpecials + '&thinsp;\/&thinsp;' + s.totalSpecials +
@@ -927,8 +895,7 @@ ${items}
                           (s.status === 'up_to_date' && s.total > 0 && s.watched < s.total) ||
                           (s.status === 'up_to_date' && s.watched === 0) ||
                           (s.watched > 0 && s.status === 'not_started_yet') ||
-                          (s.watched === s.total && s.total > 0 && s.status === 'stopped') ||
-                          (s.isFollowed === false && s.watched > 0);
+                          (s.watched === s.total && s.total > 0 && s.status === 'stopped');
         var issuesCell = hasAnyIssue ? '\u26a0\ufe0f' : '<span class="na">\u2014<\/span>';
 
         // Notes cell
@@ -938,10 +905,8 @@ ${items}
           '<tr' + cls + dStyle + '>' +
           '<td class="td-num">'      + (hidden ? '' : visNum) + '<\/td>' +
           '<td class="td-title">'    + esc(s.title) + links + '<\/td>' +
-          '<td class="td-status">'   + (s.isEnded ? 'Ended' : 'Continuing') + '<\/td>' +
           '<td class="td-id">'       + (s.tvdbId != null ? esc(String(s.tvdbId)) : '<span class="na">\u2014<\/span>') + '<\/td>' +
           '<td class="td-id">'       + (s.imdbId      ? esc(s.imdbId)            : '<span class="na">\u2014<\/span>') + '<\/td>' +
-          '<td class="td-status">'   + followedCell + '<\/td>' +
           '<td class="td-status">'   + esc(s.status) + '<\/td>' +
           '<td class="td-eps">'      + s.watched + '&thinsp;\/&thinsp;' + s.total + bar + showBadges + '<\/td>' +
           '<td class="td-specials">' + specialsCell + '<\/td>' +

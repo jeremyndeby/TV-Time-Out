@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "TV Time Out",
+  "name": "TV Time Out by Refract",
   "version": "1.1.1",
-  "description": "Exporte tes données TV Time (séries suivies, épisodes vus, statuts) en CSV ou JSON.",
+  "description": "Export your complete TV Time tracking data — shows, anime, movies, episodes and custom lists. Fast, 100% client-side, no server required. Built by the Refract team.",
 
   "permissions": [
     "storage",

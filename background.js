@@ -453,7 +453,7 @@ async function runExport(userId, token, tabId) {
       results.forEach((res, j) => {
         const show  = batch[j];
         const value = res.status === "fulfilled" ? res.value : null;
-        show._ref.seasons = value?.seasons ?? value?.data?.seasons ?? [];
+        show._ref.seasons = value?.seasons ?? [];
         if (!value) failedShows.push({ title: show.title, tvdbId: show.tvdbId });
       });
       if (i % 15 === 0) {
@@ -510,7 +510,7 @@ async function runExport(userId, token, tabId) {
           const show  = batch[j];
           const value = res.status === "fulfilled" ? res.value : null;
           if (value) {
-            show._ref.seasons = value?.seasons ?? value?.data?.seasons ?? [];
+            show._ref.seasons = value?.seasons ?? [];
           } else {
             stillFailed.push(show);
           }
@@ -563,7 +563,7 @@ async function runExport(userId, token, tabId) {
           } catch (_) { value = null; }
 
           if (value) {
-            const seasons  = value?.seasons ?? value?.data?.seasons ?? [];
+            const seasons  = value?.seasons ?? [];
             const totalEps = seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
             if (totalEps > 0) {
               show._ref.seasons = seasons;
@@ -580,15 +580,13 @@ async function runExport(userId, token, tabId) {
     // Normalisation — Format TV Time Liberator
     // -------------------------------------------------------------------------
 
-    // Séries + animés → { uuid, id, created_at, title, status, is_followed, seasons[] }
+    // Séries + animés → { uuid, id, created_at, title, status, seasons[] }
     const shows = showsRaw.map(show => ({
       uuid:             show.uuid                           ?? null,
       id:               { tvdb: show.meta?.id ?? null, imdb: null },
       created_at:       show.created_at                    ?? null,
       title:            show.meta?.name ?? show.meta?.title ?? null,
       status:           show.filter?.[1] ?? "unknown",
-      is_followed:      show.type === 'follow',
-      is_ended:         show.meta?.is_ended ?? false,
       _noEpisodeData:   exhaustedRetries.has(show.meta?.id ?? null),
       seasons:    (show.seasons ?? []).map(season => ({
         number:      season.number,

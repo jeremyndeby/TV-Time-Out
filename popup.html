@@ -32,7 +32,7 @@
     /* Header */
     .header {
       display: flex;
-      align-items: center;
+      align-items: baseline;
       gap: 10px;
       margin-bottom: 16px;
     }
@@ -49,6 +49,9 @@
       letter-spacing: 2px;
       text-transform: uppercase;
       color: #f5c518;
+      line-height: 1;
+      margin: 0;
+      padding: 0;
     }
     .header .badge {
       background: #6b2d8b;
@@ -210,6 +213,7 @@
   <div class="header">
     <img src="icons/logo.png" alt="TV Time Out logo" />
     <h1>TV TIME OUT</h1>
+    <span style="font-family:'Bebas Neue',sans-serif;font-size:15px;letter-spacing:2px;color:#6b2d8b;line-height:1;margin:0;padding:0;">BY REFRACT</span>
 
   </div>
 
@@ -243,6 +247,7 @@
 
   <div class="divider"></div>
   <div class="footer">100% client-side &mdash; no data leaves your browser</div>
+  <div style="font-size:0.66rem;color:#555555;text-align:center;margin-top:4px;opacity:0.6;">Have a suggestion or feedback?<br>Share it with the <a href="https://getrefract.app/discord" target="_blank" style="color:#f5c518;text-decoration:none;">Refract community</a>!</div>
 
   <div id="version-label"></div>
 
