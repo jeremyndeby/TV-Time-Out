@@ -597,7 +597,7 @@ export function buildSummaryHtml(shows, movies, date) {
 <body>
 
   <div class="header">
-    <h1>&#128250; <span style="color:#f5c518">TV TIME OUT</span> <span style="font-size:0.55em;color:#6b2d8b;letter-spacing:2px;vertical-align:middle;">BY REFRACT</span> \u2014 Export Summary</h1>
+    <h1>&#128250; <span style="color:#f5c518">TV TIME OUT</span> <span style="font-size:0.55em;color:#6b2d8b;letter-spacing:2px;vertical-align:middle;"><a href="https://getrefract.app/" target="_blank" style="color:inherit;text-decoration:none;">BY REFRACT</a></span> \u2014 Export Summary</h1>
     <div class="stats">
       <div class="stat"><span class="stat-label">Export date</span><span class="stat-value">${escapeHtml(date)}</span></div>
       <div class="stat"><span class="stat-label">Shows</span><span class="stat-value">${showList.length.toLocaleString()}</span></div>
