@@ -19,6 +19,8 @@ import { buildSummaryHtml } from './exporter.js';
 // État interne du service worker
 // ---------------------------------------------------------------------------
 let cachedCredentials = null; // { userId, token }
+let exportCancelled   = false; // flipped by CANCEL_EXPORT; checked at every major pipeline step
+const CANCEL_SENTINEL = "__TVTO_CANCELLED__"; // error message used to unwind runExport on cancel
 let exportState = {
   status:     "idle",   // "idle" | "running" | "done" | "error"
   step:       null,     // texte affiché dans le popup pendant "running"
@@ -91,6 +93,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         // Prefer fully-loaded, non-discarded tabs; fall back to any tab if none qualify.
         const best = tabs.find(t => t.status === "complete" && !t.discarded) ?? tabs[0];
 
+        exportCancelled = false;
         exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
         sendResponse({ ok: true });
 
@@ -99,12 +102,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
 
+    case "CANCEL_EXPORT": {
+      // Flip the flag; the running pipeline will observe it at the next checkpoint
+      // and throw CANCEL_SENTINEL, which is converted to status: "cancelled" below.
+      if (exportState.status === "running") {
+        exportCancelled = true;
+      }
+      // If nothing is running, just move to a clean cancelled state so the popup
+      // can observe it on its next poll.
+      exportState = { status: "cancelled", step: null, stepIndex: 0, fetchCount: "", loaded: 0, total: null, result: null, error: null };
+      sendResponse({ ok: true });
+      return false;
+    }
+
     case "EXPORT_PROGRESS": {
       sendResponse({ ...exportState });
       return false;
     }
 
     case "RESET_EXPORT": {
+      exportCancelled = false;
       exportState = { status: "idle", step: null, stepIndex: 0, fetchCount: "", loaded: 0, total: null, result: null, error: null };
       sendResponse({ ok: true });
       return false;
@@ -361,7 +378,14 @@ async function runExport(userId, token, tabId) {
   const cgwBase    = "https://msapi.tvtime.com/prod/v1/tracking/cgw/follows/user/" + userId;
   const watchesBase= "https://msapi.tvtime.com/prod/v1/tracking/watches/user/"     + userId;
 
+  // Throws CANCEL_SENTINEL if the user clicked Cancel. Called at each major
+  // pipeline checkpoint; the outer try/catch converts it to status "cancelled".
+  const throwIfCancelled = () => {
+    if (exportCancelled) throw new Error(CANCEL_SENTINEL);
+  };
+
   try {
+    throwIfCancelled();
     // -------------------------------------------------------------------------
     // Étape 1 — Séries + animés suivis
     // -------------------------------------------------------------------------
@@ -380,10 +404,13 @@ async function runExport(userId, token, tabId) {
     }
 
     const seriesRaw = await fetchWithRetry("series", 1000);
+    throwIfCancelled();
     const animeRaw  = await fetchWithRetry("anime",  1000);
+    throwIfCancelled();
 
     // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
     const moviesRaw = await fetchWithRetry("movie", 1000);
+    throwIfCancelled();
 
     const showsRaw = [...seriesRaw, ...animeRaw];
     exportState.loaded     = showsRaw.length;
@@ -397,6 +424,7 @@ async function runExport(userId, token, tabId) {
     exportState.stepIndex = 2;
 
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
+    throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
     // This removes orphaned watch records for shows the user has unfollowed,
@@ -441,6 +469,7 @@ async function runExport(userId, token, tabId) {
     });
 
     for (let i = 0; i < showsNeedingSeasons.length; i += BATCH_SIZE) {
+      throwIfCancelled();
       const batch = showsNeedingSeasons.slice(i, i + BATCH_SIZE);
       const results = await Promise.allSettled(
         batch.map(show =>
@@ -474,6 +503,7 @@ async function runExport(userId, token, tabId) {
     let totalRecovered     = 0;
 
     while (retryList.length > 0) {
+      throwIfCancelled();
       const before = retryList.length;
 
       // Refresh JWT token at the start of each retry round — long exports can
@@ -497,6 +527,7 @@ async function runExport(userId, token, tabId) {
 
       const stillFailed = [];
       for (let i = 0; i < retryList.length; i += BATCH_SIZE) {
+        throwIfCancelled();
         const batch = retryList.slice(i, i + BATCH_SIZE);
         const results = await Promise.allSettled(
           batch.map(show =>
@@ -552,8 +583,10 @@ async function runExport(userId, token, tabId) {
       exportState.step = `🔄 Retrying ${zeroEpShows.length} show(s) with no episode data (up to 3×90s)...`;
 
       for (const show of zeroEpShows) {
+        throwIfCancelled();
         let recovered = false;
         for (let attempt = 1; attempt <= MAX_EP_RETRIES; attempt++) {
+          throwIfCancelled();
           let value = null;
           try {
             value = await Promise.race([
@@ -648,6 +681,7 @@ async function runExport(userId, token, tabId) {
     // Initial pass
     let movieRetryList = [];
     for (let i = 0; i < moviesWithUuid.length; i += MOVIE_BATCH) {
+      throwIfCancelled();
       const batch   = moviesWithUuid.slice(i, i + MOVIE_BATCH);
       const results = await Promise.allSettled(
         batch.map(m =>
@@ -673,11 +707,13 @@ async function runExport(userId, token, tabId) {
     // Retry loop
     let mAttempts = 0, mNoImprove = 0, mRecovered = 0;
     while (movieRetryList.length > 0) {
+      throwIfCancelled();
       const before = movieRetryList.length;
       exportState.step = `⏳ Retrying ${before} failed movie details... (attempt ${mAttempts + 1}, recovered ${mRecovered} so far)`;
 
       const stillFailed = [];
       for (let i = 0; i < movieRetryList.length; i += MOVIE_BATCH) {
+        throwIfCancelled();
         const batch   = movieRetryList.slice(i, i + MOVIE_BATCH);
         const results = await Promise.allSettled(
           batch.map(m =>
@@ -708,6 +744,8 @@ async function runExport(userId, token, tabId) {
 
     // Apply years to movie objects
     movies.forEach(m => { m.year = movieYearMap.get(m.uuid) ?? null; });
+
+    throwIfCancelled();
 
     // -------------------------------------------------------------------------
     // Étape 5 — Listes utilisateur
@@ -775,6 +813,23 @@ async function runExport(userId, token, tabId) {
     });
 
   } catch (err) {
+    // Cancellation unwinds the pipeline via a sentinel error — treat it as a
+    // clean stop, not an error.
+    if (err?.message === CANCEL_SENTINEL) {
+      exportCancelled = false;
+      exportState = {
+        status: "cancelled",
+        step:   null,
+        stepIndex: 0,
+        fetchCount: "",
+        loaded: 0,
+        total:  null,
+        result: null,
+        error:  null
+      };
+      console.log("[TVTO BG] Export cancelled by user.");
+      return;
+    }
     exportState = {
       status: "error",
       step:   null,

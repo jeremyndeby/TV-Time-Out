@@ -128,6 +128,26 @@
     #btn-export:active:not(:disabled) { transform: scale(0.98); }
     #btn-export:disabled              { opacity: 0.45; cursor: not-allowed; }
 
+    /* Cancel button — visible only while an export is running */
+    #btn-cancel {
+      display: none;
+      width: 100%;
+      padding: 12px 32px;
+      background: #8b0000;
+      color: #ffffff;
+      border: none;
+      border-radius: 50px;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      letter-spacing: 0.01em;
+      margin-top: 8px;
+    }
+    #btn-cancel.visible         { display: block; }
+    #btn-cancel:hover           { background: #a00000; }
+    #btn-cancel:active          { transform: scale(0.98); }
+
     /* Format selector */
     .format-row {
       display: flex;
@@ -241,6 +261,7 @@
   </div>
 
   <button id="btn-export">Export my data</button>
+  <button id="btn-cancel" type="button">Cancel</button>
 
   <div id="warning-bar"></div>
   <div id="warning-bar-movies"></div>

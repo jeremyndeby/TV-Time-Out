@@ -20,6 +20,7 @@ const progressBar   = document.getElementById("progress-bar");
 const fetchCountEl  = document.getElementById("fetch-count");
 const elapsedEl     = document.getElementById("elapsed-time");
 const btnExport     = document.getElementById("btn-export");
+const btnCancel     = document.getElementById("btn-cancel");
 const warningBar       = document.getElementById("warning-bar");
 const warningBarMovies = document.getElementById("warning-bar-movies");
 const formatSelect     = document.getElementById("format-select");
@@ -80,7 +81,17 @@ function stopTimer(clearStorage = true) {
 
 function resetToIdle() {
   btnExport.disabled = false;
+  hideCancelButton();
   hideProgress();
+}
+
+function showCancelButton() {
+  btnCancel.classList.add("visible");
+  btnCancel.disabled = false;
+}
+
+function hideCancelButton() {
+  btnCancel.classList.remove("visible");
 }
 
 function setDisconnectedUI() {
@@ -221,6 +232,7 @@ function handleExportDone(state) {
 
   setStatus(`✓ ${parts.join(" · ")} exported. Downloading files…`, "success");
   btnExport.disabled = false;
+  hideCancelButton();
 
   // Warning bar séries — affiché seulement si des séries ont échoué
   if (failed > 0) {
@@ -270,10 +282,18 @@ function handleExportState(state) {
       showProgress(state.stepIndex, state.fetchCount, state.pct ?? null);
       setStatus(state.step || "Fetching your data…", "running", true);
       btnExport.disabled = true;
+      showCancelButton();
       break;
 
     case "done":
       handleExportDone(state);
+      break;
+
+    case "cancelled":
+      stopPolling();
+      stopTimer();
+      resetToIdle();
+      setStatus("Export cancelled.", "info");
       break;
 
     case "error":
@@ -331,6 +351,7 @@ async function init() {
   if (state.status === "running") {
     setStatus(state.step || "Fetching your data...", "running", true);
     btnExport.disabled = true;
+    showCancelButton();
     chrome.storage.local.get(["exportStartTime"], (data) => {
       stopTimer(false);
       if (data.exportStartTime) {
@@ -379,10 +400,26 @@ btnExport.addEventListener("click", async () => {
 
   setStatus("Starting export…", "running", true);
   btnExport.disabled = true;
+  showCancelButton();
   showProgress();
   chrome.storage.local.set({ exportStartTime: Date.now() });
   startTimer();
   startPolling();
+});
+
+// ---------------------------------------------------------------------------
+// Cancel button — stops the running export and resets the UI immediately.
+// The service worker checks an exportCancelled flag at each major pipeline
+// step; we don't wait for confirmation, we just reset the UI and send the
+// message in parallel. The next poll will observe status "cancelled".
+// ---------------------------------------------------------------------------
+btnCancel.addEventListener("click", async () => {
+  btnCancel.disabled = true;
+  stopPolling();
+  stopTimer();
+  resetToIdle();
+  setStatus("Export cancelled.", "info");
+  await sendMsg({ type: "CANCEL_EXPORT" });
 });
 
 // ---------------------------------------------------------------------------
