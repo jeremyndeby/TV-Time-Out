@@ -189,69 +189,72 @@ async function fetchObjectsViaTab(tabId, innerUrl, entityType, pageLimit) {
 }
 
 // ---------------------------------------------------------------------------
-// Polling : attend que window.__tvto_${tvdbId}_result soit défini dans la page,
-// toutes les 200 ms, avec un timeout max de maxMs.
-// Clé unique par tvdbId → appels parallèles sans collision.
+// Fetch épisodes d'une série via msapi.tvtime.com (un seul appel renvoie
+// TOUS les épisodes, toutes saisons confondues).
+//
+// Endpoint : GET https://msapi.tvtime.com/v1/series/{seriesId}/episodes
+// seriesId = TV Time show ID (show.id dans la réponse follows), PAS le TVDB ID.
+//
+// Réponse : { status: "success", data: [{ id, number, name, is_special,
+//                                          season: { number } }, ...] }
+//
+// Exécuté directement depuis le service worker (plus de MAIN world /
+// executeScript / polling). On regroupe la liste plate par season.number
+// pour reconstituer la structure { seasons: [{ number, episodes: [...] }] }
+// que la suite du pipeline attend déjà.
 // ---------------------------------------------------------------------------
-async function waitForResult(tabId, tvdbId, maxMs = 55000) {
-  const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    await new Promise(r => setTimeout(r, 200));
-    const res = await chrome.scripting.executeScript({
-      target: { tabId },
-      world:  "MAIN",
-      func:   (id) => window[`__tvto_${id}_result`],
-      args:   [tvdbId]
-    });
-    if (res?.[0]?.result !== undefined) return res[0].result;
+async function fetchSingleViaTab(token, seriesId) {
+  const innerUrl = `https://msapi.tvtime.com/v1/series/${seriesId}/episodes`;
+  const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
+
+  const response = await fetch(url, {
+    headers: {
+      "Authorization": "Bearer " + token,
+      "App-Version": "2025082201",
+      "Client-Version": "10.10.0"
+    }
+  });
+
+  if (!response.ok) return null;
+  const raw = await response.json();
+  if (!raw?.data) return null;
+
+  const seasonMap = new Map();
+  for (const ep of raw.data) {
+    const seasonNum = ep?.season?.number ?? 0;
+    if (!seasonMap.has(seasonNum)) {
+      seasonMap.set(seasonNum, { number: seasonNum, episodes: [] });
+    }
+    seasonMap.get(seasonNum).episodes.push(ep);
   }
-  return null; // timeout
+  const seasons = [...seasonMap.values()].sort((a, b) => a.number - b.number);
+  return { seasons };
 }
 
 // ---------------------------------------------------------------------------
-// Fetch saisons d'une série via le sidecar TV Time (évite CORS).
-// Encode l'URL api2.tozelabs.com en base64 pour la passer au sidecar.
-// Clé unique par tvdbId → safe en parallèle (pas de collision window).
+// Fetch une liste favoris (favorite-series ou favorite-movies) via le sidecar
+// TV Time. Retourne un tableau d'IDs (data.objects[].id). En cas d'erreur,
+// renvoie [] pour ne pas bloquer l'export.
 // ---------------------------------------------------------------------------
-async function fetchSingleViaTab(tabId, tvdbId) {
-  const innerUrl = `https://api2.tozelabs.com/v2/show/${tvdbId}/extended/seasons`;
-  const o_b64    = btoa(innerUrl).replace(/=/g, "");
-  const url      = `https://app.tvtime.com/sidecar?o_b64=${o_b64}`;
+async function fetchFavoritesList(token, userId, listKey, idField = "id") {
+  const innerUrl = `https://msapi.tvtime.com/prod/v2/lists/user/${userId}/lists/${listKey}`;
+  const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  // 1. Stocker l'URL et réinitialiser le slot résultat dans la page
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  "MAIN",
-    func:   (url, id) => {
-      window[`__tvto_${id}_url`]    = url;
-      window[`__tvto_${id}_result`] = undefined;
-    },
-    args:   [url, tvdbId]
-  });
-
-  // 2. Lancer le fetch depuis la page (token lu dans localStorage)
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  "MAIN",
-    func: (id) => {
-      const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
-      fetch(window[`__tvto_${id}_url`], {
-        credentials: "include",
-        headers: {
-          "Authorization":  "Bearer " + token,
-          "App-Version":    "2025082201",
-          "Client-Version": "10.10.0"
-        }
-      })
-      .then(r => r.json())
-      .then(d => { window[`__tvto_${id}_result`] = d; })
-      .catch(e => { window[`__tvto_${id}_result`] = { error: e.message }; });
-    },
-    args: [tvdbId]
-  });
-
-  // 3. Attendre la résolution via polling (200 ms × 40 max = 8 s)
-  return waitForResult(tabId, tvdbId);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "Authorization": "Bearer " + token,
+        "App-Version": "2025082201",
+        "Client-Version": "10.10.0"
+      }
+    });
+    if (!response.ok) return [];
+    const raw = await response.json();
+    const objects = raw?.data?.objects ?? raw?.objects ?? [];
+    return objects.map(o => o?.[idField]).filter(v => v != null);
+  } catch (_) {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,7 +367,7 @@ async function fetchMovieDetailViaTab(tabId, uuid) {
 // Export 5 étapes :
 //   1. Shows follows (series + anime)
 //   2. Watch history (épisodes + films)
-//   3. Détails saisons par série (api2.tozelabs.com)
+//   3. Détails saisons/épisodes par série (msapi.tvtime.com/v1/series/{id}/episodes)
 //   4. Détails films (msapi.tvtime.com/prod/v1/movies)
 //   5. Listes utilisateur (msapi.tvtime.com/prod/v2/lists)
 //
@@ -445,6 +448,22 @@ async function runExport(userId, token, tabId) {
     });
 
     // -------------------------------------------------------------------------
+    // Fetch favorites lists (series + movies) in parallel.
+    // Runs between watch history and season details so that favorite flags
+    // are available during normalization.
+    // -------------------------------------------------------------------------
+    exportState.step = "Fetching your favorites...";
+
+    const [favSeriesIdsArr, favMovieIdsArr] = await Promise.all([
+      fetchFavoritesList(token, userId, "favorite-series", "id"),
+      fetchFavoritesList(token, userId, "favorite-movies", "uuid")
+    ]);
+    throwIfCancelled();
+
+    const favoriteSeriesIds = new Set(favSeriesIdsArr);
+    const favoriteMoviesIds = new Set(favMovieIdsArr);
+
+    // -------------------------------------------------------------------------
     // Étape 3 — Détails saisons/épisodes par série
     // Batch parallèle de 5, timeout individuel (10s) + timeout batch (15s).
     // Pas de retry — évite les blocages du service worker MV3.
@@ -452,20 +471,22 @@ async function runExport(userId, token, tabId) {
     exportState.step      = `Step 3/5: Fetching episode details... (0/${showsRaw.length})`;
     exportState.stepIndex = 3;
 
-    const BATCH_SIZE   = 5;
+    const BATCH_SIZE   = 10;
     const SHOW_TIMEOUT = 90000;
     const failedShows  = [];
 
-    // Pré-calcul : liste plate des shows avec leur tvdbId et title
+    // Pré-calcul : liste plate des shows avec leur seriesId (TV Time ID) et title.
+    // Le nouvel endpoint msapi.tvtime.com/v1/series/{seriesId}/episodes utilise
+    // l'ID TV Time (show.id), PAS le TVDB ID.
     const showsNeedingSeasons = showsRaw.map(show => ({
-      tvdbId: show.meta?.id ?? null,
-      title:  show.meta?.name ?? show.meta?.title ?? null,
-      _ref:   show   // référence vers l'objet d'origine pour mutater show.seasons
-    })).filter(s => s.tvdbId != null);
+      seriesId: show.meta?.id ?? null,
+      title:    show.meta?.name ?? show.meta?.title ?? null,
+      _ref:     show   // référence vers l'objet d'origine pour mutater show.seasons
+    })).filter(s => s.seriesId != null);
 
-    // Shows sans tvdbId → seasons vide directement
+    // Shows sans seriesId → seasons vide directement
     showsRaw.forEach(show => {
-      if (!show.meta?.id) show.seasons = [];
+      if (!show.id) show.seasons = [];
     });
 
     for (let i = 0; i < showsNeedingSeasons.length; i += BATCH_SIZE) {
@@ -474,7 +495,7 @@ async function runExport(userId, token, tabId) {
       const results = await Promise.allSettled(
         batch.map(show =>
           Promise.race([
-            fetchSingleViaTab(tabId, show.tvdbId),
+            fetchSingleViaTab(token, show.seriesId),
             new Promise(r => setTimeout(() => r(null), SHOW_TIMEOUT))
           ])
         )
@@ -483,7 +504,7 @@ async function runExport(userId, token, tabId) {
         const show  = batch[j];
         const value = res.status === "fulfilled" ? res.value : null;
         show._ref.seasons = value?.seasons ?? [];
-        if (!value) failedShows.push({ title: show.title, tvdbId: show.tvdbId });
+        if (!value) failedShows.push({ title: show.title, seriesId: show.seriesId });
       });
       if (i % 15 === 0) {
         const pct = 30 + Math.round((i / showsNeedingSeasons.length) * 70);
@@ -495,7 +516,7 @@ async function runExport(userId, token, tabId) {
     // Retry des séries échouées —
     // Au moins 50 tentatives garanties, puis arrêt si 10 rounds consécutifs sans amélioration.
     let retryList          = failedShows
-      .map(f => showsNeedingSeasons.find(s => s.tvdbId === f.tvdbId))
+      .map(f => showsNeedingSeasons.find(s => s.seriesId === f.seriesId))
       .filter(Boolean);
 
     let totalAttempts      = 0;
@@ -532,7 +553,7 @@ async function runExport(userId, token, tabId) {
         const results = await Promise.allSettled(
           batch.map(show =>
             Promise.race([
-              fetchSingleViaTab(tabId, show.tvdbId),
+              fetchSingleViaTab(token, show.seriesId),
               new Promise(r => setTimeout(() => r(null), SHOW_TIMEOUT))
             ])
           )
@@ -561,7 +582,9 @@ async function runExport(userId, token, tabId) {
       if (totalAttempts >= 100 && noImprovementCount >= 20) break;
     }
 
-    const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s.tvdbId }));
+    // failedShows entries still report tvdbId (from the show metadata) for the
+    // CSV/JSON failure file — that output format is consumed by exporter.js.
+    const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s._ref?.meta?.id ?? null }));
 
     // ── Retry shows that came back with 0 episodes — up to 3 attempts, 90s each ─
     // These shows fetched successfully but returned empty season data.
@@ -576,7 +599,7 @@ async function runExport(userId, token, tabId) {
       return seasons.length === 0 || totalEps === 0;
     });
 
-    // Set to track shows that failed all 3 retries (keyed by tvdbId)
+    // Set to track shows that failed all 3 retries (keyed by seriesId)
     const exhaustedRetries = new Set();
 
     if (zeroEpShows.length > 0) {
@@ -590,7 +613,7 @@ async function runExport(userId, token, tabId) {
           let value = null;
           try {
             value = await Promise.race([
-              fetchSingleViaTab(tabId, show.tvdbId),
+              fetchSingleViaTab(token, show.seriesId),
               new Promise(r => setTimeout(() => r(null), RETRY_TIMEOUT))
             ]);
           } catch (_) { value = null; }
@@ -605,7 +628,7 @@ async function runExport(userId, token, tabId) {
             }
           }
         }
-        if (!recovered) exhaustedRetries.add(show.tvdbId);
+        if (!recovered) exhaustedRetries.add(show.seriesId);
       }
     }
 
@@ -620,7 +643,8 @@ async function runExport(userId, token, tabId) {
       created_at:       show.created_at                    ?? null,
       title:            show.meta?.name ?? show.meta?.title ?? null,
       status:           show.filter?.[1] ?? "unknown",
-      _noEpisodeData:   exhaustedRetries.has(show.meta?.id ?? null),
+      is_favorite:      favoriteSeriesIds.has(show.meta?.id),
+      _noEpisodeData:   exhaustedRetries.has(show.id ?? null),
       seasons:    (show.seasons ?? []).map(season => ({
         number:      season.number,
         is_specials: season.number === 0,
@@ -634,7 +658,10 @@ async function runExport(userId, token, tabId) {
           special:    ep.is_special ?? (season.number === 0),
           is_watched:    watchedAtMap.has(String(ep.id?.tvdb ?? ep.id)) || (ep.is_watched ?? false),
           watched_at:    formatWatchedAt(watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.watched_at),
-          rewatch_count: watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.rewatch_count ?? 0
+          rewatch_count: watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.rewatch_count ?? 0,
+          watched_count: watchedAtMap.has(String(ep.id?.tvdb ?? ep.id))
+            ? (watchedAtMap.get(String(ep.id?.tvdb ?? ep.id))?.rewatch_count ?? 0) + 1
+            : (ep.is_watched ? 1 : 0)
         }))
       }))
     }));
@@ -656,6 +683,7 @@ async function runExport(userId, token, tabId) {
         year:          null, // populated in Step 4/5
         watched_at:    m.watched_at ?? null,
         is_watched:    m.extended?.is_watched ?? meta?.is_watched ?? false,
+        is_favorite:   favoriteMoviesIds.has(m.uuid),
         rewatch_count: m.rewatch_count ?? 0
       };
     });

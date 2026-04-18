@@ -243,6 +243,7 @@ export function buildSummaryHtml(shows, movies, date) {
           isWatched:    ep.is_watched    ?? false,
           watchedAt:    ep.watched_at    ?? null,
           rewatchCount: ep.rewatch_count ?? 0,
+          watchedCount: ep.watched_count ?? 0,
           issues
         });
       }
@@ -304,6 +305,7 @@ export function buildSummaryHtml(shows, movies, date) {
       tvdbId,
       imdbId,
       status:             show.status ?? "",
+      isFavorite:         show.is_favorite ?? false,
       watched,
       total,
       pct,
@@ -334,6 +336,10 @@ export function buildSummaryHtml(shows, movies, date) {
   const totalRegularWithDate    = totalRegularWatched - totalRegularNoDate;
   const regularDatePct          = totalRegularWatched > 0 ? Math.round((totalRegularWithDate / totalRegularWatched) * 100) : 0;
   const totalSpecialsWatched    = showData.reduce((acc, s) => acc + s.watchedSpecials, 0);
+  // Totals for the header stats line — regular (non-special, non-TBA) episodes only.
+  const totalRegularEpisodes    = showData.reduce((acc, s) => acc + s.total,   0);
+  const regularWatchPct         = totalRegularEpisodes > 0 ? Math.round((totalRegularWatched / totalRegularEpisodes) * 100) : 0;
+  const showsFavoritesCount     = showData.filter(s => s.isFavorite).length;
 
   // ── Pre-compute movie data ─────────────────────────────────────────────────
   const movieData = movieList.map(movie => {
@@ -347,6 +353,7 @@ export function buildSummaryHtml(shows, movies, date) {
       uuid,
       year:         movie.year          ?? null,
       isWatched:    movie.is_watched    ?? false,
+      isFavorite:   movie.is_favorite   ?? false,
       watchedAt:    movie.watched_at    ?? null,
       rewatchCount: movie.rewatch_count ?? 0,
       rowClass:     (movie.is_watched   ?? false) ? "row-green" : "",
@@ -361,26 +368,10 @@ export function buildSummaryHtml(shows, movies, date) {
   const totalMoviesWithDate     = movieData.filter(m => m.isWatched && m.watchedAt).length;
   const totalMoviesNoDate       = totalMoviesWatched - totalMoviesWithDate;
   const movieDatePct            = totalMoviesWatched > 0 ? Math.round((totalMoviesWithDate / totalMoviesWatched) * 100) : 0;
+  const moviesWatchPct          = movieData.length > 0 ? Math.round((totalMoviesWatched / movieData.length) * 100) : 0;
+  const moviesFavoritesCount    = movieData.filter(m => m.isFavorite).length;
 
-  // Movies table stays static HTML (sort/filter not requested for movies)
-  const movieRowsHtml = movieData.map(movie => {
-    const links = [
-      movie.tvtHref  ? `<a href="${movie.tvtHref}"  target="_blank" rel="noopener">TV Time</a>` : "",
-      movie.tvdbHref ? `<a href="${movie.tvdbHref}" target="_blank" rel="noopener">TVDB</a>`    : "",
-      movie.imdbHref ? `<a href="${movie.imdbHref}" target="_blank" rel="noopener">IMDb</a>`    : "",
-    ].filter(Boolean).join(" · ");
-    const linksHtml    = links ? `<span class="links">${links}</span>` : "";
-    const rewatchBadge = movie.rewatchCount > 0
-      ? ` <span class="badge">${movie.rewatchCount}\u00D7</span>` : "";
-    return `    <tr${movie.rowClass ? ` class="${movie.rowClass}"` : ""}>
-      <td class="td-title">${escapeHtml(movie.title)}${movie.year ? `<span class="year-badge">(${movie.year})</span>` : ""}${linksHtml}</td>
-      <td class="td-id">${movie.tvdbId != null ? escapeHtml(String(movie.tvdbId)) : '<span class="na">\u2014</span>'}</td>
-      <td class="td-id">${movie.imdbId ? escapeHtml(movie.imdbId) : '<span class="na">\u2014</span>'}</td>
-      <td class="td-status">${movie.isWatched ? "Yes" : "No"}</td>
-      <td class="td-date">${movie.watchedAt ? escapeHtml(movie.watchedAt) : '<span class="na">\u2014</span>'}</td>
-      <td class="td-rewatch">${movie.rewatchCount}${rewatchBadge}</td>
-    </tr>`;
-  }).join("\n");
+  // Movies table is JS-rendered below (sort + filter) — no static HTML.
 
   // Embed data — escape </ to prevent premature </script> tag close
   const showsJson  = JSON.stringify(showData).replace(/<\//g, "<\\/");
@@ -544,6 +535,14 @@ export function buildSummaryHtml(shows, movies, date) {
     }
     .flag-nodate  { background: rgba(239,68,68,.15);  color: #f87171; }
 
+    /* ── Favorite star (column cell) ─────────────────────────────────────── */
+    .fav-star {
+      color: #e74c3c;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .td-fav { text-align: center; }
+
     /* ── Rewatch badge ───────────────────────────────────────────────────── */
     .badge {
       display: inline-block; margin-left: 4px; padding: 1px 5px;
@@ -620,11 +619,17 @@ export function buildSummaryHtml(shows, movies, date) {
       <span class="ss-hi">${totalRegularWatched.toLocaleString()}</span> regular episodes watched
       <span class="ss-dim">(${totalRegularWithDate.toLocaleString()} with date &nbsp;&middot;&nbsp; ${totalRegularNoDate.toLocaleString()} without date &nbsp;&middot;&nbsp; ${regularDatePct}% date coverage)</span>
       &nbsp;&middot;&nbsp; <span class="ss-hi">${totalSpecialsWatched.toLocaleString()}</span> specials watched
+      &nbsp;&middot;&nbsp; <span class="ss-hi">${totalRegularEpisodes.toLocaleString()}</span> regular episodes total
+      <span class="ss-dim">(${regularWatchPct}% watched)</span>
+      &nbsp;&middot;&nbsp; <span class="ss-hi">${showsFavoritesCount.toLocaleString()}</span> favorites
     </div>
     <div class="ss-section">
       <span class="ss-label">Movies</span>
       <span class="ss-hi">${totalMoviesWatched.toLocaleString()}</span> watched
       <span class="ss-dim">(${totalMoviesWithDate.toLocaleString()} with date &nbsp;&middot;&nbsp; ${totalMoviesNoDate.toLocaleString()} without date &nbsp;&middot;&nbsp; ${movieDatePct}% date coverage)</span>
+      &nbsp;&middot;&nbsp; <span class="ss-hi">${movieData.length.toLocaleString()}</span> total
+      <span class="ss-dim">(${moviesWatchPct}% watched)</span>
+      &nbsp;&middot;&nbsp; <span class="ss-hi">${moviesFavoritesCount.toLocaleString()}</span> favorites
     </div>
   </div>
 
@@ -643,6 +648,7 @@ export function buildSummaryHtml(shows, movies, date) {
         <tr>
           <th class="th-num" style="width:36px">#</th>
           <th class="sortable sort-asc" data-sortcol="0" onclick="sortBy(0)" style="width:220px">Title</th>
+          <th class="sortable" data-sortcol="11" onclick="sortBy(11)" style="width:50px">Fav</th>
           <th class="sortable" data-sortcol="1" onclick="sortBy(1)" style="width:80px">TVDB ID</th>
           <th class="sortable" data-sortcol="2" onclick="sortBy(2)" style="width:80px">IMDb ID</th>
           <th class="sortable" data-sortcol="4" onclick="sortBy(4)" style="width:110px">Status</th>
@@ -655,6 +661,7 @@ export function buildSummaryHtml(shows, movies, date) {
         <tr class="filter-row">
           <th class="th-num"></th>
           <th><input class="col-filter" type="search" placeholder="Title\u2026" autocomplete="off" oninput="setFilter(0,this.value)"></th>
+          <th><select class="col-filter" onchange="setFilter(11,this.value)"><option value="">All</option><option value="yes">Favorites</option><option value="no">Non-favorites</option></select></th>
           <th><input class="col-filter" type="search" placeholder="TVDB\u2026"  autocomplete="off" oninput="setFilter(1,this.value)"></th>
           <th><input class="col-filter" type="search" placeholder="IMDb\u2026"  autocomplete="off" oninput="setFilter(2,this.value)"></th>
           <th><select class="col-filter" onchange="setFilter(4,this.value)"><option value="">All</option><option value="up_to_date">up_to_date</option><option value="continuing">continuing</option><option value="stopped">stopped</option><option value="not_started_yet">not_started_yet</option><option value="unknown">unknown</option></select></th>
@@ -669,22 +676,30 @@ export function buildSummaryHtml(shows, movies, date) {
     </table>
   </div>
 
-  <p class="section-title">Movies (${movieList.length.toLocaleString()})</p>
+  <p class="section-title">Movies (<span id="movies-filter-count">${movieList.length.toLocaleString()}</span>)</p>
   <div class="tbl-wrap">
-    <table>
-      <thead>
+    <table id="movies-table">
+      <thead id="movies-thead">
         <tr>
-          <th style="width:220px">Title</th>
-          <th style="width:80px">TVDB ID</th>
-          <th style="width:80px">IMDb ID</th>
-          <th style="width:80px">Watched</th>
-          <th style="width:120px">Watched date</th>
-          <th style="width:80px">Rewatches</th>
+          <th class="sortable sort-asc" data-sortcol="0" onclick="sortMovies(0)" style="width:220px">Title</th>
+          <th class="sortable" data-sortcol="1" onclick="sortMovies(1)" style="width:50px">Fav</th>
+          <th class="sortable" data-sortcol="2" onclick="sortMovies(2)" style="width:80px">TVDB ID</th>
+          <th class="sortable" data-sortcol="3" onclick="sortMovies(3)" style="width:80px">IMDb ID</th>
+          <th class="sortable" data-sortcol="4" onclick="sortMovies(4)" style="width:80px">Watched</th>
+          <th class="sortable" data-sortcol="5" onclick="sortMovies(5)" style="width:120px">Watched date</th>
+          <th class="sortable" data-sortcol="6" onclick="sortMovies(6)" style="width:80px">Rewatches</th>
+        </tr>
+        <tr class="filter-row">
+          <th><input class="col-filter" type="search" placeholder="Title\u2026" autocomplete="off" oninput="setMovieFilter(0,this.value)"></th>
+          <th></th>
+          <th><input class="col-filter" type="search" placeholder="TVDB\u2026"  autocomplete="off" oninput="setMovieFilter(2,this.value)"></th>
+          <th><input class="col-filter" type="search" placeholder="IMDb\u2026"  autocomplete="off" oninput="setMovieFilter(3,this.value)"></th>
+          <th></th>
+          <th></th>
+          <th></th>
         </tr>
       </thead>
-      <tbody>
-${movieRowsHtml}
-      </tbody>
+      <tbody id="movies-tbody"></tbody>
     </table>
   </div>
 
@@ -721,7 +736,7 @@ ${items}
     var _col = 8, _dir = 'desc';
 
     // ── Per-column filter state (index = sort col) ────────────────────────────
-    var _filters = ['', '', '', '', '', '', '', '', ''];
+    var _filters = ['', '', '', '', '', '', '', '', '', '', '', ''];
 
     // ── HTML-escape helper for values inserted via innerHTML ─────────────────
     function esc(s) {
@@ -761,6 +776,7 @@ ${items}
         return _dir === 'asc' ? r : -r;
       }
       else if (_col === 10) { va = a.watchedNoDate; vb = b.watchedNoDate; }
+      else if (_col === 11) { va = a.isFavorite ? 1 : 0; vb = b.isFavorite ? 1 : 0; }
       else                 { va = a.pctSpecials; vb = b.pctSpecials; }
       // Empty / null values sort last in both directions
       var aEmpty = (va === '' || va === Infinity), bEmpty = (vb === '' || vb === Infinity);
@@ -784,6 +800,10 @@ ${items}
         if (_filters[8] === 'yes' && !hasNoDate) return true;
         if (_filters[8] === 'no'  &&  hasNoDate) return true;
       }
+      if (_filters[11]) {
+        if (_filters[11] === 'yes' && !s.isFavorite) return true;
+        if (_filters[11] === 'no'  &&  s.isFavorite) return true;
+      }
       return false;
     }
 
@@ -791,7 +811,11 @@ ${items}
     function fmtEp(ep) {
       var s = ep.season  != null ? String(ep.season)  : '?';
       var e = ep.episode != null ? String(ep.episode) : '?';
-      return 'S' + (s.length < 2 ? '0' + s : s) + 'E' + (e.length < 2 ? '0' + e : e);
+      var label = 'S' + (s.length < 2 ? '0' + s : s) + 'E' + (e.length < 2 ? '0' + e : e);
+      if (ep.watchedCount && ep.watchedCount > 1) {
+        label += ' <span class="badge">x' + ep.watchedCount + '<\/span>';
+      }
+      return label;
     }
 
     // ── Human-readable notes — all details inline in Notes column ───────────
@@ -884,6 +908,9 @@ ${items}
         var showBadges = '';
         if (s.allMissingDates) showBadges += ' <span class="flag-badge flag-nodate">no dates<\/span>';
 
+        // Favorite cell — star when true, nothing otherwise
+        var favCell = s.isFavorite ? '<span class="fav-star">\u2665<\/span>' : '';
+
         // Specials cell (purple, em-dash when none)
         var specialsCell = s.totalSpecials > 0
           ? s.watchedSpecials + '&thinsp;\/&thinsp;' + s.totalSpecials +
@@ -905,6 +932,7 @@ ${items}
           '<tr' + cls + dStyle + '>' +
           '<td class="td-num">'      + (hidden ? '' : visNum) + '<\/td>' +
           '<td class="td-title">'    + esc(s.title) + links + '<\/td>' +
+          '<td class="td-fav">'      + favCell + '<\/td>' +
           '<td class="td-id">'       + (s.tvdbId != null ? esc(String(s.tvdbId)) : '<span class="na">\u2014<\/span>') + '<\/td>' +
           '<td class="td-id">'       + (s.imdbId      ? esc(s.imdbId)            : '<span class="na">\u2014<\/span>') + '<\/td>' +
           '<td class="td-status">'   + esc(s.status) + '<\/td>' +
@@ -946,8 +974,99 @@ ${items}
       render();
     }
 
+    // ── Movies table: sort/filter state + render (mirror of shows table) ──────
+    var _mCol = 0, _mDir = 'asc';
+    var _mFilters = ['', '', '', '', '', '', ''];
+
+    function mCmp(a, b) {
+      var va, vb, r;
+      if (_mCol === 0) {
+        r = a.title.trim().localeCompare(b.title.trim(), undefined, { sensitivity: 'base' });
+        return _mDir === 'asc' ? r : -r;
+      }
+      if      (_mCol === 1) { va = a.isFavorite ? 1 : 0;      vb = b.isFavorite ? 1 : 0; }
+      else if (_mCol === 2) { va = a.tvdbId != null ? Number(a.tvdbId) : Infinity;
+                              vb = b.tvdbId != null ? Number(b.tvdbId) : Infinity; }
+      else if (_mCol === 3) { va = (a.imdbId || '').trim().toLowerCase();
+                              vb = (b.imdbId || '').trim().toLowerCase(); }
+      else if (_mCol === 4) { va = a.isWatched ? 1 : 0;       vb = b.isWatched ? 1 : 0; }
+      else if (_mCol === 5) { va = a.watchedAt || '';          vb = b.watchedAt || ''; }
+      else if (_mCol === 6) { va = a.rewatchCount || 0;        vb = b.rewatchCount || 0; }
+      else                  { va = 0; vb = 0; }
+      var aEmpty = (va === '' || va === Infinity), bEmpty = (vb === '' || vb === Infinity);
+      if (aEmpty && !bEmpty) return 1;
+      if (!aEmpty && bEmpty) return -1;
+      if (va < vb) return _mDir === 'asc' ? -1 : 1;
+      if (va > vb) return _mDir === 'asc' ?  1 : -1;
+      return 0;
+    }
+
+    function mIsHidden(m) {
+      if (_mFilters[0] && m.title.toLowerCase().indexOf(_mFilters[0]) === -1) return true;
+      if (_mFilters[2] && String(m.tvdbId ?? '').indexOf(_mFilters[2]) === -1) return true;
+      if (_mFilters[3] && (m.imdbId || '').toLowerCase().indexOf(_mFilters[3]) === -1) return true;
+      return false;
+    }
+
+    function renderMovies() {
+      var sorted = MOVIES.slice().sort(mCmp);
+      var html   = '';
+      var visN   = 0;
+      for (var i = 0; i < sorted.length; i++) {
+        var m      = sorted[i];
+        var hidden = mIsHidden(m);
+        if (!hidden) visN++;
+        var dStyle = hidden ? ' style="display:none"' : '';
+        var cls    = m.rowClass ? ' class="' + m.rowClass + '"' : '';
+
+        var lp = [];
+        if (m.tvtHref)  lp.push('<a href="' + esc(m.tvtHref)  + '" target="_blank" rel="noopener">TV Time<\/a>');
+        if (m.tvdbHref) lp.push('<a href="' + esc(m.tvdbHref) + '" target="_blank" rel="noopener">TVDB<\/a>');
+        if (m.imdbHref) lp.push('<a href="' + esc(m.imdbHref) + '" target="_blank" rel="noopener">IMDb<\/a>');
+        var links    = lp.length ? '<span class="links">' + lp.join(' &middot; ') + '<\/span>' : '';
+        var yearHtml = m.year ? '<span class="year-badge">(' + m.year + ')<\/span>' : '';
+        var favCell  = m.isFavorite ? '<span class="fav-star">\u2665<\/span>' : '';
+
+        html +=
+          '<tr' + cls + dStyle + '>' +
+          '<td class="td-title">'   + esc(m.title) + yearHtml + links + '<\/td>' +
+          '<td class="td-fav">'     + favCell + '<\/td>' +
+          '<td class="td-id">'      + (m.tvdbId != null ? esc(String(m.tvdbId)) : '<span class="na">\u2014<\/span>') + '<\/td>' +
+          '<td class="td-id">'      + (m.imdbId      ? esc(m.imdbId)            : '<span class="na">\u2014<\/span>') + '<\/td>' +
+          '<td class="td-status">'  + (m.isWatched ? 'Yes' : 'No') + '<\/td>' +
+          '<td class="td-date">'    + (m.watchedAt ? esc(m.watchedAt) : '<span class="na">\u2014<\/span>') + '<\/td>' +
+          '<td class="td-rewatch">' + (m.rewatchCount || 0) + '<\/td>' +
+          '<\/tr>';
+      }
+      document.getElementById('movies-tbody').innerHTML = html;
+      var anyFilter = _mFilters.some(function(f) { return f !== ''; });
+      var countEl   = document.getElementById('movies-filter-count');
+      if (countEl) countEl.textContent = anyFilter ? (visN + '\u00a0/\u00a0' + MOVIES.length) : MOVIES.length.toLocaleString();
+      updateMoviesHeaders();
+    }
+
+    function updateMoviesHeaders() {
+      var ths = document.querySelectorAll('#movies-thead th[data-sortcol]');
+      for (var i = 0; i < ths.length; i++) {
+        var col = parseInt(ths[i].getAttribute('data-sortcol'), 10);
+        ths[i].className = 'sortable' + (col === _mCol ? ' sort-' + _mDir : '');
+      }
+    }
+
+    function sortMovies(col) {
+      if (_mCol === col) { _mDir = _mDir === 'asc' ? 'desc' : 'asc'; }
+      else               { _mCol = col; _mDir = 'asc'; }
+      renderMovies();
+    }
+
+    function setMovieFilter(col, value) {
+      _mFilters[col] = value.toLowerCase().trim();
+      renderMovies();
+    }
+
     // ── Boot ──────────────────────────────────────────────────────────────────
     render();
+    renderMovies();
   <\/script>
 </body>
 </html>`;
