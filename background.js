@@ -831,11 +831,14 @@ async function runExport(userId, token, tabId) {
       error:  null
     };
 
-    // Download HTML summary from background so it survives popup close
+    // Download HTML summary from background so it survives popup close.
+    // Use a base64 data URL (NOT a blob URL): blob URLs created in the SW
+    // become invalid the moment the SW is suspended, breaking the download.
     const htmlDate    = new Date().toISOString().split('T')[0];
     const htmlContent = buildSummaryHtml(result.shows, result.movies, htmlDate);
-    chrome.downloads.download({
-      url:      'data:text/html;charset=utf-8,' + encodeURIComponent(htmlContent),
+    const htmlBase64  = btoa(unescape(encodeURIComponent(htmlContent)));
+    await chrome.downloads.download({
+      url:      `data:text/html;base64,${htmlBase64}`,
       filename: `tvtime-summary-${htmlDate}.html`,
       saveAs:   false
     });
@@ -859,13 +862,4 @@ async function runExport(userId, token, tabId) {
       return;
     }
     exportState = {
-      status: "error",
-      step:   null,
-      loaded: exportState.loaded,
-      total:  null,
-      result: null,
-      error:  err.message ?? String(err)
-    };
-    console.error("[TVTO BG] Erreur export :", err);
-  }
-}
+      status: "erro

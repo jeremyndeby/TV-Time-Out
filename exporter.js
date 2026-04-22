@@ -26,21 +26,25 @@ function escapeHtml(val) {
     .replace(/"/g, "&quot;");
 }
 
-function triggerDownload(blob, name) {
-  const url = URL.createObjectURL(blob);
-  const a   = document.createElement("a");
+function triggerDownload(payload, name) {
+  // MV3-safe: use a base64 data URL instead of a blob URL.
+  // Blob URLs created in the popup/SW context can be revoked when the SW
+  // sleeps, breaking the download. Data URLs are self-contained.
+  const base64 = btoa(unescape(encodeURIComponent(payload.content)));
+  const url    = `data:${payload.mime};base64,${base64}`;
+  const a      = document.createElement("a");
   a.href     = url;
   a.download = name;
   document.body.appendChild(a);
   a.click();
-  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+  setTimeout(() => { a.remove(); }, 1000);
 }
 
 function toJsonBlob(data) {
-  return new Blob(
-    [JSON.stringify(data, null, 2)],
-    { type: "application/json;charset=utf-8;" }
-  );
+  return {
+    content: JSON.stringify(data, null, 2),
+    mime:    "application/json"
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -59,7 +63,7 @@ function escapeCell(val) {
 
 function toCsvBlob(rows) {
   const csv = rows.map(r => r.map(escapeCell).join(",")).join("\r\n");
-  return new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  return { content: csv, mime: "text/csv" };
 }
 
 function buildSeriesCsv(shows) {
@@ -1084,7 +1088,7 @@ ${items}
  * @param {{ shows?: Array, movies?: Array, failedShows?: Array, failedMovies?: Array }} result
  * @param {"json"|"csv"|"both"} format
  */
-export function downloadAll(result, format = "json") {
+export async function downloadAll(result, format = "json") {
   const date  = new Date().toISOString().split("T")[0];
   const files = [];
 
@@ -1136,7 +1140,10 @@ export function downloadAll(result, format = "json") {
 
   if (!files.length) throw new Error("Aucune donnée à télécharger.");
 
-  files.forEach((f, i) => {
-    setTimeout(() => triggerDownload(f.blob, f.name), i * 600);
-  });
+  // Sequence downloads one by one (not in parallel) so each save dialog /
+  // browser download slot resolves before the next one is triggered.
+  for (const f of files) {
+    triggerDownload(f.blob, f.name);
+    await new Promise(r => setTimeout(r, 600));
+  }
 }
