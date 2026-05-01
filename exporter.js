@@ -1083,12 +1083,17 @@ ${items}
 // ---------------------------------------------------------------------------
 
 /**
- * Télécharge les données selon le format choisi ("json" | "csv" | "both").
+ * Build the list of output files (JSON and/or CSV) from an export result,
+ * WITHOUT triggering any download. Used both by downloadAll (popup side,
+ * individual downloads) and by background.js (service worker side, ZIP
+ * bundling). The HTML summary is intentionally not included here — it is
+ * produced separately via buildSummaryHtml().
  *
- * @param {{ shows?: Array, movies?: Array, failedShows?: Array, failedMovies?: Array }} result
+ * @param {{ shows?: Array, movies?: Array, lists?: Array, failedShows?: Array, failedMovies?: Array }} result
  * @param {"json"|"csv"|"both"} format
+ * @returns {{ date: string, files: Array<{ name: string, blob: { content: string, mime: string } }> }}
  */
-export async function downloadAll(result, format = "json") {
+export function buildFilesList(result, format = "json") {
   const date  = new Date().toISOString().split("T")[0];
   const files = [];
 
@@ -1137,6 +1142,18 @@ export async function downloadAll(result, format = "json") {
       files.push({ name: `tvtime-failed-${date}.csv`, blob: buildFailedCsv(allFailed) });
     }
   }
+
+  return { date, files };
+}
+
+/**
+ * Télécharge les données selon le format choisi ("json" | "csv" | "both").
+ *
+ * @param {{ shows?: Array, movies?: Array, failedShows?: Array, failedMovies?: Array }} result
+ * @param {"json"|"csv"|"both"} format
+ */
+export async function downloadAll(result, format = "json") {
+  const { files } = buildFilesList(result, format);
 
   if (!files.length) throw new Error("Aucune donnée à télécharger.");
 

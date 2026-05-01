@@ -13,7 +13,16 @@
  *   { type: "EXPORT_PROGRESS" }                        → polling depuis popup.js
  */
 
-import { buildSummaryHtml } from './exporter.js';
+import { buildSummaryHtml, buildFilesList } from './exporter.js';
+
+// JSZip is a UMD bundle. The manifest declares this service worker as
+// "type": "module", which makes importScripts() unavailable — module workers
+// require ES imports. Loading jszip.min.js as a side-effect ES import still
+// runs the UMD wrapper, whose fallback branch does `self.JSZip = factory()`
+// because `self` is defined in a service worker but `exports`/`define`/
+// `window` are not. The end result is the same as importScripts: after this
+// import completes, `self.JSZip` is the JSZip constructor.
+import './jszip.min.js';
 
 // ---------------------------------------------------------------------------
 // État interne du service worker
@@ -29,7 +38,9 @@ let exportState = {
   loaded:     0,
   total:      null,
   result:     null,     // { shows, movies, lists } quand done
-  error:      null
+  error:      null,
+  format:     "json",   // "json" | "csv" | "both" — passed from popup at START_EXPORT
+  zipBundle:  false     // true → bundle all outputs into a single .zip download
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +95,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
       cachedCredentials = { token, userId };
 
+      // Capture user-selected output options (default-safe: json / no-zip).
+      const format    = ["json", "csv", "both"].includes(message.format) ? message.format : "json";
+      const zipBundle = Boolean(message.zipBundle);
+
       chrome.tabs.query({ url: "https://app.tvtime.com/*" }, (tabs) => {
         if (!tabs?.length) {
           sendResponse({ ok: false, error: "Aucun onglet app.tvtime.com ouvert." });
@@ -94,7 +109,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const best = tabs.find(t => t.status === "complete" && !t.discarded) ?? tabs[0];
 
         exportCancelled = false;
-        exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null };
+        exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null, format, zipBundle };
         sendResponse({ ok: true });
 
         runExport(userId, token, best.id);
@@ -152,14 +167,21 @@ async function fetchObjectsViaTab(tabId, innerUrl, entityType, pageLimit) {
         "Client-Version": "10.10.0"
       };
 
+      // Paginate via page_offset (0, pageLimit, 2×pageLimit, …).
+      // Earlier revisions used &page=1,2,3 but the sidecar silently ignored it
+      // and kept returning the first batch — users with 4000+ movies saw only
+      // the first 1000. The correct TV Time param is page_offset (object
+      // index, not page index). The duplicate-first-uuid guard is kept as a
+      // defensive stop in case a future backend tweak makes page_offset a
+      // no-op too.
       const allObjects    = [];
-      let   page          = 1;
+      let   pageOffset    = 0;
       let   lastFirstUuid = null;
 
       while (true) {
         let data;
         try {
-          const r = await fetch(base + "&page=" + page, { credentials: "include", headers });
+          const r = await fetch(base + "&page_offset=" + pageOffset, { credentials: "include", headers });
           data = await r.json();
         } catch (e) {
           return { error: e.message };
@@ -175,7 +197,7 @@ async function fetchObjectsViaTab(tabId, innerUrl, entityType, pageLimit) {
         lastFirstUuid = firstUuid;
 
         if (objects.length < pageLimit) break;
-        page++;
+        pageOffset += pageLimit;
       }
 
       return { objects: allObjects };
@@ -271,6 +293,27 @@ function formatWatchedAt(raw) {
   const s = raw.replace("T", " ").replace(/(\d{2}:\d{2}:\d{2}).*$/, "$1");
   // Vérifie qu'on obtient bien "YYYY-MM-DD HH:MM:SS" (19 chars)
   return s.length >= 19 ? s.substring(0, 19) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Re-read the JWT token from the TV Time tab's localStorage. Returns null if
+// the read fails or the token isn't present, so callers can fall back to the
+// token they already hold. Used for PROACTIVE token refresh at major pipeline
+// boundaries — for users with 4000+ shows an export can outlast the JWT
+// lifetime, and without a fresh token every watch-history / movie-detail
+// fetch silently returns 0 results.
+// ---------------------------------------------------------------------------
+async function getFreshToken(tabId) {
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      world:  "MAIN",
+      func:   () => localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "")
+    });
+    return result?.[0]?.result ?? null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +439,19 @@ async function runExport(userId, token, tabId) {
     exportState.stepIndex = 1;
     exportState.pct       = null;
 
+    // Proactive JWT refresh at the step boundary — cheap, and if the token has
+    // been rotated by the TV Time tab since START_EXPORT we want every
+    // downstream fetch to use the fresh value. Null result = keep existing
+    // token; never fail the export on a refresh miss.
+    {
+      const fresh = await getFreshToken(tabId);
+      if (fresh) {
+        token = fresh;
+        cachedCredentials = { ...cachedCredentials, token: fresh };
+        chrome.storage.session.set({ credentials: cachedCredentials });
+      }
+    }
+
     // Fetch avec retry sur résultat vide — jusqu'à 3 tentatives, délai 2s entre chaque.
     async function fetchWithRetry(entityType, pageLimit, maxRetries = 3) {
       let results = await fetchObjectsViaTab(tabId, cgwBase, entityType, pageLimit);
@@ -425,6 +481,19 @@ async function runExport(userId, token, tabId) {
     // -------------------------------------------------------------------------
     exportState.step      = "Step 2/5: Fetching watch history...";
     exportState.stepIndex = 2;
+
+    // Proactive JWT refresh — watch-history requests are the most impacted
+    // when a token ages out mid-export: the backend answers 200 with an empty
+    // objects[] array, so the export looks successful but all watch dates
+    // vanish silently. Refreshing here is the cheapest insurance.
+    {
+      const fresh = await getFreshToken(tabId);
+      if (fresh) {
+        token = fresh;
+        cachedCredentials = { ...cachedCredentials, token: fresh };
+        chrome.storage.session.set({ credentials: cachedCredentials });
+      }
+    }
 
     const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
     throwIfCancelled();
@@ -700,6 +769,18 @@ async function runExport(userId, token, tabId) {
     exportState.step      = `Step 4/5: Fetching movie details... (0/${movies.length})`;
     exportState.stepIndex = 4;
 
+    // Proactive JWT refresh — by the time we reach movie details on a large
+    // library we've already burned several minutes on episode fetches, so the
+    // token is the most likely to have rotated. Null = keep existing token.
+    {
+      const fresh = await getFreshToken(tabId);
+      if (fresh) {
+        token = fresh;
+        cachedCredentials = { ...cachedCredentials, token: fresh };
+        chrome.storage.session.set({ credentials: cachedCredentials });
+      }
+    }
+
     const MOVIE_BATCH   = 5;
     const MOVIE_TIMEOUT = 30000;
     const movieYearMap  = new Map(); // uuid → year (number)
@@ -819,29 +900,78 @@ async function runExport(userId, token, tabId) {
       }, 0)
     , 0);
 
-    const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime };
+    const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime, zipBundle: exportState.zipBundle };
 
+    // Carry zipBundle/format from the running state into the done state so
+    // the popup can observe them via EXPORT_PROGRESS and know whether to
+    // skip its client-side downloads.
     exportState = {
-      status: "done",
-      step:   null,
-      loaded: shows.length,
-      total:  shows.length,
-      count:  shows.length,
+      status:    "done",
+      step:      null,
+      loaded:    shows.length,
+      total:     shows.length,
+      count:     shows.length,
       result,
-      error:  null
+      error:     null,
+      format:    exportState.format,
+      zipBundle: exportState.zipBundle
     };
 
-    // Download HTML summary from background so it survives popup close.
+    // ─── Download: ZIP bundle vs. separate HTML summary ──────────────────────
     // Use a base64 data URL (NOT a blob URL): blob URLs created in the SW
     // become invalid the moment the SW is suspended, breaking the download.
     const htmlDate    = new Date().toISOString().split('T')[0];
     const htmlContent = buildSummaryHtml(result.shows, result.movies, htmlDate);
-    const htmlBase64  = btoa(unescape(encodeURIComponent(htmlContent)));
-    await chrome.downloads.download({
-      url:      `data:text/html;base64,${htmlBase64}`,
-      filename: `tvtime-summary-${htmlDate}.html`,
-      saveAs:   false
-    });
+
+    if (exportState.zipBundle) {
+      // Collect every output file (JSON and/or CSV, plus the HTML summary)
+      // into one JSZip, then trigger a single chrome.downloads.download call.
+      // The popup observes state.zipBundle === true and skips its own
+      // sequential downloads — see popup.js handleExportDone().
+      try {
+        const { files } = buildFilesList(result, exportState.format || "json");
+        const JSZip = self.JSZip;
+        if (typeof JSZip !== "function") {
+          throw new Error("JSZip library failed to load");
+        }
+        const zip = new JSZip();
+        for (const f of files) {
+          zip.file(f.name, f.blob.content);
+        }
+        zip.file(`tvtime-summary-${htmlDate}.html`, htmlContent);
+
+        // base64 output, not blob — blob URLs created from the SW become
+        // invalid once the SW sleeps, which would silently break the download.
+        const zipBase64 = await zip.generateAsync({ type: "base64" });
+        await chrome.downloads.download({
+          url:      `data:application/zip;base64,${zipBase64}`,
+          filename: `tvtime-export-${htmlDate}.zip`,
+          saveAs:   false
+        });
+      } catch (zipErr) {
+        console.error("[TVTO BG] ZIP bundling failed:", zipErr);
+        // Surface the failure to the popup so the user isn't left with no download.
+        exportState = {
+          status: "error",
+          step:   null,
+          loaded: exportState.loaded,
+          total:  null,
+          result: null,
+          error:  `ZIP bundling failed: ${zipErr.message ?? String(zipErr)}`,
+          format: exportState.format,
+          zipBundle: exportState.zipBundle
+        };
+      }
+    } else {
+      // Classic behaviour — download the HTML summary from the SW (survives
+      // popup close); popup.js downloads the JSON/CSV files individually.
+      const htmlBase64 = btoa(unescape(encodeURIComponent(htmlContent)));
+      await chrome.downloads.download({
+        url:      `data:text/html;base64,${htmlBase64}`,
+        filename: `tvtime-summary-${htmlDate}.html`,
+        saveAs:   false
+      });
+    }
 
   } catch (err) {
     // Cancellation unwinds the pipeline via a sentinel error — treat it as a
@@ -862,4 +992,13 @@ async function runExport(userId, token, tabId) {
       return;
     }
     exportState = {
-      status: "erro
+      status: "error",
+      step:   null,
+      loaded: exportState.loaded,
+      total:  null,
+      result: null,
+      error:  err.message ?? String(err)
+    };
+    console.error("[TVTO BG] Erreur export :", err);
+  }
+}

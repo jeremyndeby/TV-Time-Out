@@ -174,6 +174,73 @@
       background-position: right 10px center;
     }
 
+    /* Bundle-as-ZIP toggle row */
+    .zip-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .zip-row .zip-labels {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      line-height: 1.2;
+    }
+    .zip-row .zip-title {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+    }
+    .zip-row .zip-subtitle {
+      font-size: 0.66rem;
+      color: #666;
+    }
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 36px;
+      height: 20px;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle-slider {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: #2a1a3a;
+      border: 1px solid #6b2d8b;
+      border-radius: 20px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .toggle-slider::before {
+      content: "";
+      position: absolute;
+      height: 12px;
+      width: 12px;
+      left: 2px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: #8892a4;
+      border-radius: 50%;
+      transition: transform 0.15s, background 0.15s;
+    }
+    .toggle-switch input:checked + .toggle-slider {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .toggle-switch input:checked + .toggle-slider::before {
+      transform: translate(16px, -50%);
+      background: #000000;
+    }
+    .toggle-switch input:focus-visible + .toggle-slider {
+      box-shadow: 0 0 0 2px rgba(245, 197, 24, 0.4);
+    }
+
     /* Warning bars (échecs séries et films) */
     #warning-bar,
     #warning-bar-movies {
@@ -258,6 +325,17 @@
       <option value="csv">CSV</option>
       <option value="both">Both</option>
     </select>
+  </div>
+
+  <div class="zip-row">
+    <div class="zip-labels">
+      <span class="zip-title">Bundle as ZIP</span>
+      <span class="zip-subtitle">Recommended if you're only getting one file</span>
+    </div>
+    <label class="toggle-switch" for="zip-toggle" title="Bundle all output files into a single .zip download">
+      <input type="checkbox" id="zip-toggle" />
+      <span class="toggle-slider"></span>
+    </label>
   </div>
 
   <button id="btn-export">Export my data</button>

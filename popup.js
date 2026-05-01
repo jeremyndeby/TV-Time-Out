@@ -24,6 +24,7 @@ const btnCancel     = document.getElementById("btn-cancel");
 const warningBar       = document.getElementById("warning-bar");
 const warningBarMovies = document.getElementById("warning-bar-movies");
 const formatSelect     = document.getElementById("format-select");
+const zipToggle        = document.getElementById("zip-toggle");
 
 // ---------------------------------------------------------------------------
 // Local state
@@ -95,7 +96,7 @@ function hideCancelButton() {
 }
 
 function setDisconnectedUI() {
-  [btnExport, formatSelect].forEach(el => {
+  [btnExport, formatSelect, zipToggle].forEach(el => {
     if (!el) return;
     el.style.opacity       = "0.4";
     el.style.pointerEvents = "none";
@@ -104,7 +105,7 @@ function setDisconnectedUI() {
 }
 
 function clearDisconnectedUI() {
-  [btnExport, formatSelect].forEach(el => {
+  [btnExport, formatSelect, zipToggle].forEach(el => {
     if (!el) return;
     el.style.opacity       = "";
     el.style.pointerEvents = "";
@@ -133,8 +134,22 @@ function sendMsg(msg) {
 // ---------------------------------------------------------------------------
 async function getCredentialsFromTab() {
   return new Promise((resolve) => {
-    chrome.tabs.query({ url: "https://app.tvtime.com/*" }, async (tabs) => {
-      if (!tabs?.length) { resolve(null); return; }
+    chrome.tabs.query({ url: "*://app.tvtime.com/*" }, async (tabs) => {
+      // Fallback — Chrome's URL matcher occasionally misses tabs (pending
+      // navigations, non-https schemes, transient about:blank states). If
+      // nothing matched, inspect the active tab and accept it as a candidate
+      // when its URL still mentions app.tvtime.com.
+      if (!tabs?.length) {
+        const activeTabs = await new Promise((r) =>
+          chrome.tabs.query({ active: true, currentWindow: true }, r)
+        );
+        const active = activeTabs?.[0];
+        if (active?.url?.includes("app.tvtime.com")) {
+          tabs = [active];
+        } else {
+          resolve(null); return;
+        }
+      }
 
       // Filter to tabs that are fully loaded and not discarded/suspended.
       // executeScript fails silently on discarded or still-loading tabs even
@@ -175,22 +190,30 @@ async function getCredentialsFromTab() {
         return { token, userId };
       };
 
-      // Try each candidate tab in order; return on first success.
-      for (const tab of candidates) {
-        const result = await new Promise((res) => {
-          chrome.scripting.executeScript(
-            { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
-            (results) => {
-              if (chrome.runtime.lastError) {
-                console.warn("[TVTO] executeScript skipped tab", tab.id, "—", chrome.runtime.lastError.message);
-                res(null); return;
+      // Try each candidate tab; if none return a valid token, wait 800ms and
+      // retry the whole sweep up to 3 times. Handles cases where Flutter
+      // hasn't finished initializing localStorage when the popup opens.
+      const MAX_ATTEMPTS = 4; // 1 initial + 3 retries
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        for (const tab of candidates) {
+          const result = await new Promise((res) => {
+            chrome.scripting.executeScript(
+              { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
+              (results) => {
+                if (chrome.runtime.lastError) {
+                  console.warn("[TVTO] executeScript skipped tab", tab.id, "—", chrome.runtime.lastError.message);
+                  res(null); return;
+                }
+                const r = results?.[0]?.result;
+                res(r?.token ? r : null);
               }
-              const r = results?.[0]?.result;
-              res(r?.token ? r : null);
-            }
-          );
-        });
-        if (result) { resolve(result); return; }
+            );
+          });
+          if (result) { resolve(result); return; }
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, 800));
+        }
       }
 
       resolve(null);
@@ -202,8 +225,18 @@ async function ensureCredentials() {
   const { credentials } = await sendMsg({ type: "GET_CREDENTIALS" });
   if (credentials?.token && credentials?.userId) return credentials;
 
-  const fresh = await getCredentialsFromTab();
-  if (!fresh) return null;
+  // Retry loop — Flutter may not have finished initializing localStorage when
+  // the popup opens, so the first executeScript attempt can return a null
+  // token even though the user is logged in. Retry up to 3 times with a 1s
+  // delay between attempts before giving up.
+  const MAX_RETRIES = 3;
+  let fresh = await getCredentialsFromTab();
+  for (let attempt = 1; attempt <= MAX_RETRIES && !fresh?.token; attempt++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    fresh = await getCredentialsFromTab();
+  }
+
+  if (!fresh?.token) return null;
 
   await sendMsg({ type: "CREDENTIALS_FROM_PAGE", ...fresh });
   return fresh;
@@ -250,27 +283,40 @@ function handleExportDone(state) {
     warningBarMovies.classList.remove("visible");
   }
 
-  // Auto-download — no user click required
+  // Auto-download — no user click required.
+  // When zipBundle is true the service worker already produced a single zip
+  // via chrome.downloads.download; the popup must not call downloadAll().
   try {
-    const format = formatSelect?.value ?? "json";
-    downloadAll(r, format);
-    // Update message after downloads are queued
-    const fileCount = [shows, movies, lists].filter(Boolean).length + (failed > 0 ? 1 : 0) + (failedMovies > 0 ? 1 : 0);
-    const durationS = r.durationMs ? Math.round(r.durationMs / 1000) : null;
+    const format     = formatSelect?.value ?? "json";
+    const zipBundle  = Boolean(state?.zipBundle ?? r.zipBundle);
+    const durationS  = r.durationMs ? Math.round(r.durationMs / 1000) : null;
     const formatLabel = format === "both" ? "JSON+CSV" : format.toUpperCase();
     const parts = [];
     if (durationS !== null) parts.push(`${durationS}s`);
-    parts.push(formatLabel);
+    parts.push(zipBundle ? `${formatLabel} · ZIP` : formatLabel);
     if (shows)  parts.push(`${shows} shows & ${episodes.toLocaleString()} eps 📺`);
     if (movies) parts.push(`${movies} movies 📽️`);
     if (lists)  parts.push(`${lists} lists 📋`);
     const summaryStr = parts.length ? ` (${parts.join(" · ")})` : "";
-    setTimeout(() => {
-      setStatus(`🎉 Great success! Export complete & files saved.${summaryStr}`, "success");
-      // Clear the export state so reopening the popup returns to "Ready to export."
-      // without re-triggering downloads.
-      sendMsg({ type: "RESET_EXPORT" });
-    }, fileCount * 600 + 200);
+
+    if (zipBundle) {
+      // Single-file download already issued by the service worker — no
+      // client-side work needed, just flip the status to success.
+      setTimeout(() => {
+        setStatus(`🎉 Great success! Export complete & bundled as ZIP.${summaryStr}`, "success");
+        sendMsg({ type: "RESET_EXPORT" });
+      }, 400);
+    } else {
+      downloadAll(r, format);
+      // Update message after downloads are queued
+      const fileCount = [shows, movies, lists].filter(Boolean).length + (failed > 0 ? 1 : 0) + (failedMovies > 0 ? 1 : 0);
+      setTimeout(() => {
+        setStatus(`🎉 Great success! Export complete & files saved.${summaryStr}`, "success");
+        // Clear the export state so reopening the popup returns to "Ready to export."
+        // without re-triggering downloads.
+        sendMsg({ type: "RESET_EXPORT" });
+      }, fileCount * 600 + 200);
+    }
   } catch (e) {
     setStatus(`Export done but download failed: ${e.message}`, "error");
   }
@@ -336,6 +382,11 @@ async function init() {
     if (data.exportFormat) formatSelect.value = data.exportFormat;
   });
 
+  // Restore previously saved ZIP-bundle preference (default: off)
+  chrome.storage.local.get("zipBundle", (data) => {
+    zipToggle.checked = data.zipBundle ?? false;
+  });
+
   const credentials = await ensureCredentials();
 
   if (!credentials?.token || !credentials?.userId) {
@@ -378,7 +429,18 @@ async function init() {
 // Export button
 // ---------------------------------------------------------------------------
 btnExport.addEventListener("click", async () => {
-  const credentials = await ensureCredentials();
+  let credentials = await ensureCredentials();
+
+  // Last-chance fresh read — if the cached/retry lookup came back empty,
+  // try one direct getCredentialsFromTab() call before surfacing an error,
+  // so a user who just logged in isn't told to log in again.
+  if (!credentials?.token) {
+    const fresh = await getCredentialsFromTab();
+    if (fresh?.token) {
+      await sendMsg({ type: "CREDENTIALS_FROM_PAGE", ...fresh });
+      credentials = fresh;
+    }
+  }
 
   if (!credentials?.token) {
     setStatus(`Please log in at <a href="https://app.tvtime.com" target="_blank" style="color: #f5c518;">app.tvtime.com</a> to get started.`, "error");
@@ -387,10 +449,15 @@ btnExport.addEventListener("click", async () => {
 
   await sendMsg({ type: "RESET_EXPORT" });
 
+  const format    = formatSelect?.value ?? "json";
+  const zipBundle = Boolean(zipToggle?.checked);
+
   const resp = await sendMsg({
-    type:   "START_EXPORT",
-    token:  credentials.token,
-    userId: credentials.userId
+    type:      "START_EXPORT",
+    token:     credentials.token,
+    userId:    credentials.userId,
+    format,
+    zipBundle
   });
 
   if (!resp.ok) {
@@ -427,6 +494,13 @@ btnCancel.addEventListener("click", async () => {
 // ---------------------------------------------------------------------------
 formatSelect.addEventListener("change", () => {
   chrome.storage.local.set({ exportFormat: formatSelect.value });
+});
+
+// ---------------------------------------------------------------------------
+// ZIP-bundle toggle — persist choice across popup sessions
+// ---------------------------------------------------------------------------
+zipToggle.addEventListener("change", () => {
+  chrome.storage.local.set({ zipBundle: zipToggle.checked });
 });
 
 // ---------------------------------------------------------------------------
