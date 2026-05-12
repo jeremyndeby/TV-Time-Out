@@ -463,10 +463,42 @@ async function runExport(userId, token, tabId) {
       }
     }
 
-    // page_limit=5000 keeps each request under the Portugal sidecar 504 timeout
-    // (99999 caused HTTP 504 Gateway Timeout on large libraries). fetchObjectsViaTab
-    // already loops on page_offset and breaks when objects.length < pageLimit.
-    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 5000);
+    // Bypass app.tvtime.com sidecar for episode watches: the sidecar proxy
+    // returns HTTP 504 Gateway Timeout for Portugal users on this endpoint
+    // regardless of page_limit. Call msapi.tvtime.com directly from the
+    // service worker (CORS does not apply in SW context).
+    const epWatchHeaders = {
+      "Authorization":  "Bearer " + token,
+      "App-Version":    "2025082201",
+      "Client-Version": "10.10.0"
+    };
+    const epWatchPageLimit = 5000;
+    let   episodeWatches   = [];
+    let   epWatchOffset    = 0;
+    let   epWatchLastUuid  = null;
+    while (true) {
+      const url = `${watchesBase}?entity_type=episode&page_limit=${epWatchPageLimit}&page_offset=${epWatchOffset}`;
+      const r = await fetch(url, { headers: epWatchHeaders });
+      const text = await r.text().catch(() => "");
+      if (!r.ok) {
+        console.error(`[TVTO] episodeWatches direct HTTP ${r.status} at offset ${epWatchOffset} — body: ${text.slice(0, 200)}`);
+        break;
+      }
+      let data;
+      try { data = JSON.parse(text); }
+      catch (jsonErr) {
+        console.error(`[TVTO] episodeWatches direct JSON parse error at offset ${epWatchOffset}: ${jsonErr.message}`);
+        break;
+      }
+      const objects = data?.data?.objects ?? [];
+      if (objects.length === 0) break;
+      const firstUuid = objects[0]?.uuid;
+      if (firstUuid && firstUuid === epWatchLastUuid) break;
+      episodeWatches = episodeWatches.concat(objects);
+      epWatchLastUuid = firstUuid;
+      if (objects.length < epWatchPageLimit) break;
+      epWatchOffset += epWatchPageLimit;
+    }
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
