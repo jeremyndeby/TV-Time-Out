@@ -193,7 +193,7 @@ async function getCredentialsFromTab() {
       // Try each candidate tab; if none return a valid token, wait 800ms and
       // retry the whole sweep up to 3 times. Handles cases where Flutter
       // hasn't finished initializing localStorage when the popup opens.
-      const MAX_ATTEMPTS = 4; // 1 initial + 3 retries
+      const MAX_ATTEMPTS = 8; // 1 initial + 7 retries
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         for (const tab of candidates) {
           const result = await new Promise((res) => {
@@ -201,10 +201,16 @@ async function getCredentialsFromTab() {
               { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
               (results) => {
                 if (chrome.runtime.lastError) {
-                  console.warn("[TVTO] executeScript skipped tab", tab.id, "—", chrome.runtime.lastError.message);
+                  console.error("[TVTO] executeScript failed on tab", tab.id,
+                    "(attempt", attempt, "of", MAX_ATTEMPTS, ")—",
+                    chrome.runtime.lastError.message);
                   res(null); return;
                 }
                 const r = results?.[0]?.result;
+                if (!r?.token) {
+                  console.error("[TVTO] executeScript ran but returned no token on tab", tab.id,
+                    "(attempt", attempt, "of", MAX_ATTEMPTS, ")— result:", JSON.stringify(r));
+                }
                 res(r?.token ? r : null);
               }
             );
@@ -212,7 +218,7 @@ async function getCredentialsFromTab() {
           if (result) { resolve(result); return; }
         }
         if (attempt < MAX_ATTEMPTS) {
-          await new Promise((r) => setTimeout(r, 800));
+          await new Promise((r) => setTimeout(r, 1500));
         }
       }
 

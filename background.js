@@ -47,8 +47,16 @@ let exportState = {
 // Lecture des credentials depuis le storage persistant au démarrage
 // ---------------------------------------------------------------------------
 chrome.storage.session.get(["credentials"], (result) => {
-  if (result.credentials) {
-    cachedCredentials = result.credentials;
+  try {
+    if (chrome.runtime.lastError) {
+      console.error("[TVTO BG] boot-time session.get error:", chrome.runtime.lastError.message);
+      return;
+    }
+    if (result?.credentials) {
+      cachedCredentials = result.credentials;
+    }
+  } catch (e) {
+    console.error("[TVTO BG] boot-time session.get callback threw:", e);
   }
 });
 
@@ -152,62 +160,57 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Fetch paginé générique dans le MAIN world (via sidecar TV Time).
 // Token lu depuis localStorage avec suppression des guillemets JSON.
 // ---------------------------------------------------------------------------
-async function fetchObjectsViaTab(tabId, innerUrl, entityType, pageLimit) {
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  "MAIN",
-    func: async (innerUrl, entityType, pageLimit) => {
-      const token   = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
-      const o_b64   = btoa(innerUrl).replace(/=/g, "");
-      const base    = "https://app.tvtime.com/sidecar?o_b64=" + o_b64 +
-                      "&entity_type=" + entityType + "&page_limit=" + pageLimit;
-      const headers = {
-        "Authorization":  "Bearer " + token,
-        "App-Version":    "2025082201",
-        "Client-Version": "10.10.0"
-      };
+async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
+  const o_b64   = btoa(innerUrl).replace(/=/g, "");
+  const base    = "https://app.tvtime.com/sidecar?o_b64=" + o_b64 +
+                  "&entity_type=" + entityType + "&page_limit=" + pageLimit;
+  const headers = {
+    "Authorization":  "Bearer " + token,
+    "App-Version":    "2025082201",
+    "Client-Version": "10.10.0"
+  };
 
-      // Paginate via page_offset (0, pageLimit, 2×pageLimit, …).
-      // Earlier revisions used &page=1,2,3 but the sidecar silently ignored it
-      // and kept returning the first batch — users with 4000+ movies saw only
-      // the first 1000. The correct TV Time param is page_offset (object
-      // index, not page index). The duplicate-first-uuid guard is kept as a
-      // defensive stop in case a future backend tweak makes page_offset a
-      // no-op too.
-      const allObjects    = [];
-      let   pageOffset    = 0;
-      let   lastFirstUuid = null;
+  // Paginate via page_offset (0, pageLimit, 2×pageLimit, …).
+  // Earlier revisions used &page=1,2,3 but the sidecar silently ignored it
+  // and kept returning the first batch — users with 4000+ movies saw only
+  // the first 1000. The correct TV Time param is page_offset (object
+  // index, not page index). The duplicate-first-uuid guard is kept as a
+  // defensive stop in case a future backend tweak makes page_offset a
+  // no-op too.
+  const allObjects    = [];
+  let   pageOffset    = 0;
+  let   lastFirstUuid = null;
 
-      while (true) {
-        let data;
-        try {
-          const r = await fetch(base + "&page_offset=" + pageOffset, { credentials: "include", headers });
-          data = await r.json();
-        } catch (e) {
-          return { error: e.message };
-        }
+  while (true) {
+    const url = base + "&page_offset=" + pageOffset;
+    const r = await fetch(url, { headers });
+    const text = await r.text().catch(() => "");
+    if (!r.ok) {
+      console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — url: ${url} — body: ${text.slice(0, 200)}`);
+      break; // return whatever we've collected so far rather than crashing the export
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (jsonErr) {
+      console.error(`[TVTO] fetchObjectsViaTab JSON parse error at offset ${pageOffset}: ${jsonErr.message} — raw: ${text.slice(0, 200)}`);
+      break;
+    }
 
-        const objects = data?.data?.objects ?? [];
-        if (objects.length === 0) break;
+    const objects = data?.data?.objects ?? [];
+    if (objects.length === 0) break;
 
-        const firstUuid = objects[0]?.uuid;
-        if (firstUuid && firstUuid === lastFirstUuid) break;
+    const firstUuid = objects[0]?.uuid;
+    if (firstUuid && firstUuid === lastFirstUuid) break;
 
-        allObjects.push(...objects);
-        lastFirstUuid = firstUuid;
+    allObjects.push(...objects);
+    lastFirstUuid = firstUuid;
 
-        if (objects.length < pageLimit) break;
-        pageOffset += pageLimit;
-      }
+    if (objects.length < pageLimit) break;
+    pageOffset += pageLimit;
+  }
 
-      return { objects: allObjects };
-    },
-    args: [innerUrl, entityType, pageLimit]
-  });
-
-  const result = results?.[0]?.result;
-  if (result?.error) throw new Error(result.error);
-  return result?.objects ?? [];
+  return allObjects;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,48 +324,26 @@ async function getFreshToken(tabId) {
 // Endpoint : GET sidecar?o_b64=BASE64(msapi …/v2/lists/user/{userId}/lists)&expand=meta
 // Retourne un tableau brut de listes (chacune avec objects[]).
 // ---------------------------------------------------------------------------
-async function fetchListsViaTab(tabId, userId) {
+async function fetchListsViaTab(token, userId) {
   const innerUrl   = `https://msapi.tvtime.com/prod/v2/lists/user/${userId}`;
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
 
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  "MAIN",
-    func: async (url) => {
-      try {
-        const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
-        const r    = await fetch(url, {
-          credentials: "include",
-          headers: {
-            "Authorization":  "Bearer " + token,
-            "App-Version":    "2025082201",
-            "Client-Version": "10.10.0"
-          }
-        });
-        const text = await r.text();
-        let data;
-        try {
-          data = JSON.parse(text);
-        } catch (e) {
-          return { error: e.message, rawStart: text.slice(0, 150) };
-        }
-        return { data };
-      } catch (e) {
-        return { error: e.message };
-      }
-    },
-    args: [sidecarUrl]
-  });
-
-  const result = results?.[0]?.result;
-  if (result?.error) {
-    if (result.rawStart !== undefined) {
-      console.error("[TVTO] fetchListsViaTab JSON parse error:", result.error, "— raw start:", result.rawStart);
+  const r    = await fetch(sidecarUrl, {
+    headers: {
+      "Authorization":  "Bearer " + token,
+      "App-Version":    "2025082201",
+      "Client-Version": "10.10.0"
     }
-    throw new Error(result.error);
+  });
+  const text = await r.text();
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    console.error("[TVTO] fetchListsViaTab JSON parse error:", e.message, "— raw start:", text.slice(0, 150));
+    throw new Error(e.message);
   }
-  const raw = result?.data;
   if (Array.isArray(raw))       return raw;
   if (Array.isArray(raw?.data)) return raw.data;
   return [];
@@ -373,37 +354,24 @@ async function fetchListsViaTab(tabId, userId) {
 // Endpoint : GET sidecar?o_b64=BASE64(msapi …/v1/movies/{uuid})&random=true
 // Retourne le JSON brut de la réponse, ou null en cas d'erreur/timeout.
 // ---------------------------------------------------------------------------
-async function fetchMovieDetailViaTab(tabId, uuid) {
+async function fetchMovieDetailViaTab(token, uuid) {
   const innerUrl   = `https://msapi.tvtime.com/prod/v1/movies/${uuid}`;
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
 
-  const results = await chrome.scripting.executeScript({
-    target: { tabId },
-    world:  "MAIN",
-    func: async (url) => {
-      try {
-        const token = localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "");
-        const r = await fetch(url, {
-          credentials: "include",
-          headers: {
-            "Authorization":  "Bearer " + token,
-            "App-Version":    "2025082201",
-            "Client-Version": "10.10.0"
-          }
-        });
-        const data = await r.json();
-        return { data };
-      } catch (e) {
-        return { error: e.message };
+  try {
+    const r    = await fetch(sidecarUrl, {
+      headers: {
+        "Authorization":  "Bearer " + token,
+        "App-Version":    "2025082201",
+        "Client-Version": "10.10.0"
       }
-    },
-    args: [sidecarUrl]
-  });
-
-  const result = results?.[0]?.result;
-  if (!result || result.error) return null;
-  return result.data ?? null;
+    });
+    const data = await r.json();
+    return data ?? null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,10 +422,10 @@ async function runExport(userId, token, tabId) {
 
     // Fetch avec retry sur résultat vide — jusqu'à 3 tentatives, délai 2s entre chaque.
     async function fetchWithRetry(entityType, pageLimit, maxRetries = 3) {
-      let results = await fetchObjectsViaTab(tabId, cgwBase, entityType, pageLimit);
+      let results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit);
       for (let attempt = 1; attempt < maxRetries && results.length === 0; attempt++) {
         await sleep(2000);
-        results = await fetchObjectsViaTab(tabId, cgwBase, entityType, pageLimit);
+        results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit);
       }
       return results;
     }
@@ -495,7 +463,7 @@ async function runExport(userId, token, tabId) {
       }
     }
 
-    const episodeWatches = await fetchObjectsViaTab(tabId, watchesBase, "episode", 99999);
+    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 99999);
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
@@ -795,7 +763,7 @@ async function runExport(userId, token, tabId) {
       const results = await Promise.allSettled(
         batch.map(m =>
           Promise.race([
-            fetchMovieDetailViaTab(tabId, m.uuid),
+            fetchMovieDetailViaTab(token, m.uuid),
             new Promise(r => setTimeout(() => r(null), MOVIE_TIMEOUT))
           ])
         )
@@ -827,7 +795,7 @@ async function runExport(userId, token, tabId) {
         const results = await Promise.allSettled(
           batch.map(m =>
             Promise.race([
-              fetchMovieDetailViaTab(tabId, m.uuid),
+              fetchMovieDetailViaTab(token, m.uuid),
               new Promise(r => setTimeout(() => r(null), MOVIE_TIMEOUT))
             ])
           )
@@ -864,7 +832,7 @@ async function runExport(userId, token, tabId) {
 
     let listsRaw = [];
     try {
-      listsRaw = await fetchListsViaTab(tabId, userId);
+      listsRaw = await fetchListsViaTab(token, userId);
     } catch (listsErr) {
       console.error("[TVTO BG] fetchListsViaTab failed (non-fatal):", listsErr.message);
     }
