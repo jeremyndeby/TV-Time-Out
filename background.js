@@ -181,14 +181,34 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
   let   pageOffset    = 0;
   let   lastFirstUuid = null;
 
-  while (true) {
+  pageLoop: while (true) {
     const url = base + "&page_offset=" + pageOffset;
-    const r = await fetch(url, { headers });
-    const text = await r.text().catch(() => "");
-    if (!r.ok) {
-      console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — url: ${url} — body: ${text.slice(0, 200)}`);
-      break; // return whatever we've collected so far rather than crashing the export
+
+    // Per-page retry loop for 5xx errors (Portugal sidecar returns intermittent
+    // 504 Gateway Timeout on individual pages: a single failure must not lose
+    // the whole pagination). Up to 5 retries with exponential backoff
+    // (1s, 2s, 4s, 8s, 16s). 4xx errors (auth) still break immediately so
+    // we do not hammer the API on permanent failures.
+    const MAX_RETRIES = 5;
+    let r, text;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      r = await fetch(url, { headers });
+      text = await r.text().catch(() => "");
+      if (r.ok) break;
+      if (r.status >= 400 && r.status < 500) {
+        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — url: ${url} — body: ${text.slice(0, 200)}`);
+        break pageLoop; // 4xx: return whatever we've collected so far
+      }
+      if (attempt >= MAX_RETRIES) {
+        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — exhausted ${MAX_RETRIES} retries — url: ${url} — body: ${text.slice(0, 200)}`);
+        break pageLoop;
+      }
+      const delayMs = 1000 * Math.pow(2, attempt);
+      console.warn(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset}, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms — url: ${url}`);
+      await new Promise(res => setTimeout(res, delayMs));
     }
+    if (!r.ok) break; // safety net: should be unreachable
+
     let data;
     try {
       data = JSON.parse(text);
@@ -436,7 +456,7 @@ async function runExport(userId, token, tabId) {
     throwIfCancelled();
 
     // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
-    const moviesRaw = await fetchWithRetry("movie", 1000);
+    const moviesRaw = await fetchWithRetry("movie", 100);
     throwIfCancelled();
 
     const showsRaw = [...seriesRaw, ...animeRaw];
@@ -463,42 +483,12 @@ async function runExport(userId, token, tabId) {
       }
     }
 
-    // Bypass app.tvtime.com sidecar for episode watches: the sidecar proxy
-    // returns HTTP 504 Gateway Timeout for Portugal users on this endpoint
-    // regardless of page_limit. Call msapi.tvtime.com directly from the
-    // service worker (CORS does not apply in SW context).
-    const epWatchHeaders = {
-      "Authorization":  "Bearer " + token,
-      "App-Version":    "2025082201",
-      "Client-Version": "10.10.0"
-    };
-    const epWatchPageLimit = 5000;
-    let   episodeWatches   = [];
-    let   epWatchOffset    = 0;
-    let   epWatchLastUuid  = null;
-    while (true) {
-      const url = `${watchesBase}?entity_type=episode&page_limit=${epWatchPageLimit}&page_offset=${epWatchOffset}`;
-      const r = await fetch(url, { headers: epWatchHeaders });
-      const text = await r.text().catch(() => "");
-      if (!r.ok) {
-        console.error(`[TVTO] episodeWatches direct HTTP ${r.status} at offset ${epWatchOffset} — body: ${text.slice(0, 200)}`);
-        break;
-      }
-      let data;
-      try { data = JSON.parse(text); }
-      catch (jsonErr) {
-        console.error(`[TVTO] episodeWatches direct JSON parse error at offset ${epWatchOffset}: ${jsonErr.message}`);
-        break;
-      }
-      const objects = data?.data?.objects ?? [];
-      if (objects.length === 0) break;
-      const firstUuid = objects[0]?.uuid;
-      if (firstUuid && firstUuid === epWatchLastUuid) break;
-      episodeWatches = episodeWatches.concat(objects);
-      epWatchLastUuid = firstUuid;
-      if (objects.length < epWatchPageLimit) break;
-      epWatchOffset += epWatchPageLimit;
-    }
+    // DEBUG (v1.2.14-debug-sidecar-100): revert to sidecar path with
+    // page_limit=100 to test whether the sidecar 504 timeout correlates
+    // with response size. Direct msapi.tvtime.com calls fail with
+    // 403 MissingAPIKey for Portugal users (only the sidecar authenticates
+    // correctly). fetchObjectsViaTab logs URL + status on errors already.
+    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 100);
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
