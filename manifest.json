@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TV Time Out by Refract",
-  "version": "1.2.10",
+  "version": "1.2.11",
   "description": "Export your complete TV Time library — shows, movies, lists — to JSON/CSV. 100% client-side, private, no account needed.",
 
   "permissions": [

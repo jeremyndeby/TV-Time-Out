@@ -177,7 +177,7 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
   // index, not page index). The duplicate-first-uuid guard is kept as a
   // defensive stop in case a future backend tweak makes page_offset a
   // no-op too.
-  const allObjects    = [];
+  let   allObjects    = [];
   let   pageOffset    = 0;
   let   lastFirstUuid = null;
 
@@ -203,7 +203,7 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     const firstUuid = objects[0]?.uuid;
     if (firstUuid && firstUuid === lastFirstUuid) break;
 
-    allObjects.push(...objects);
+    allObjects = allObjects.concat(objects);
     lastFirstUuid = firstUuid;
 
     if (objects.length < pageLimit) break;
