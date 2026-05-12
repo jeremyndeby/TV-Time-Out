@@ -463,7 +463,10 @@ async function runExport(userId, token, tabId) {
       }
     }
 
-    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 99999);
+    // page_limit=5000 keeps each request under the Portugal sidecar 504 timeout
+    // (99999 caused HTTP 504 Gateway Timeout on large libraries). fetchObjectsViaTab
+    // already loops on page_offset and breaks when objects.length < pageLimit.
+    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 5000);
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
