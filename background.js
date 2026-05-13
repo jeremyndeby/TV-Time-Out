@@ -179,7 +179,9 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
   // no-op too.
   let   allObjects    = [];
   let   pageOffset    = 0;
-  let   lastFirstUuid = null;
+  let   lastFirstUuid    = null;
+  let   consecutiveFails = 0;       // consecutive pages that exhausted all retries
+  const MAX_CONSEC_FAILS = 5;       // break the whole loop only after this many in a row
 
   pageLoop: while (true) {
     const url = base + "&page_offset=" + pageOffset;
@@ -200,21 +202,32 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
         break pageLoop; // 4xx: return whatever we've collected so far
       }
       if (attempt >= MAX_RETRIES) {
-        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — exhausted ${MAX_RETRIES} retries — url: ${url} — body: ${text.slice(0, 200)}`);
-        break pageLoop;
+        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — exhausted ${MAX_RETRIES} retries, skipping page — url: ${url} — body: ${text.slice(0, 200)}`);
+        consecutiveFails++;
+        if (consecutiveFails >= MAX_CONSEC_FAILS) { break pageLoop; }
+        pageOffset += pageLimit;
+        continue pageLoop;
       }
       const delayMs = 1000 * Math.pow(2, attempt);
       console.warn(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset}, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms — url: ${url}`);
       await new Promise(res => setTimeout(res, delayMs));
     }
-    if (!r.ok) break; // safety net: should be unreachable
+    if (!r.ok) { // safety net: should be unreachable
+      consecutiveFails++;
+      if (consecutiveFails >= MAX_CONSEC_FAILS) break pageLoop;
+      pageOffset += pageLimit;
+      continue pageLoop;
+    }
 
     let data;
     try {
       data = JSON.parse(text);
     } catch (jsonErr) {
-      console.error(`[TVTO] fetchObjectsViaTab JSON parse error at offset ${pageOffset}: ${jsonErr.message} — raw: ${text.slice(0, 200)}`);
-      break;
+      console.error(`[TVTO] fetchObjectsViaTab JSON parse error at offset ${pageOffset}: ${jsonErr.message} — skipping page — raw: ${text.slice(0, 200)}`);
+      consecutiveFails++;
+      if (consecutiveFails >= MAX_CONSEC_FAILS) break pageLoop;
+      pageOffset += pageLimit;
+      continue pageLoop;
     }
 
     const objects = data?.data?.objects ?? [];
@@ -224,7 +237,8 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     if (firstUuid && firstUuid === lastFirstUuid) break;
 
     allObjects = allObjects.concat(objects);
-    lastFirstUuid = firstUuid;
+    lastFirstUuid    = firstUuid;
+    consecutiveFails = 0; // successful page resets the consecutive-fail streak
 
     if (objects.length < pageLimit) break;
     pageOffset += pageLimit;
@@ -455,13 +469,85 @@ async function runExport(userId, token, tabId) {
     const animeRaw  = await fetchWithRetry("anime",  1000);
     throwIfCancelled();
 
-    // Films — cgwBase retourne meta.name + meta.imdb_id + meta.external_sources + extended.is_watched
-    const moviesRaw = await fetchWithRetry("movie", 100);
+    // Films — cgwBase (follows) retourne tracked/followed movies only.
+    // Users who watched a movie without following it appear in the watches
+    // endpoint but not in follows. Fetch both and deduplicate by UUID.
+    const moviesFollowsRaw = await fetchWithRetry("movie", 100);
     throwIfCancelled();
+
+    // Watches endpoint — picks up watched-but-not-followed movies.
+    const movieWatchesRaw    = await fetchObjectsViaTab(token, watchesBase, "movie", 100);
+    throwIfCancelled();
+    const followedMovieUuids = new Set(moviesFollowsRaw.map(m => m.uuid).filter(Boolean));
+    const watchOnlyMovies    = movieWatchesRaw.filter(m => m.uuid && !followedMovieUuids.has(m.uuid));
+
+    // Enrich watch-only movies with full metadata from the detail endpoint.
+    // Objects from the watches endpoint lack the meta structure (name, ids)
+    // that cgwBase follows provide. Batch of 5, with up to 3 retry rounds.
+    // Movies whose detail fetch exhausts retries keep no meta and will appear
+    // in failedMovies (title === null) — same behaviour as other fetch failures.
+    if (watchOnlyMovies.length > 0) {
+      exportState.step = `Step 1/5: Fetching metadata for ${watchOnlyMovies.length} watch-only movie(s)...`;
+      const WO_BATCH   = 5;
+      const WO_TIMEOUT = 30000;
+      let woRetryList  = [];
+
+      for (let i = 0; i < watchOnlyMovies.length; i += WO_BATCH) {
+        throwIfCancelled();
+        const batch   = watchOnlyMovies.slice(i, i + WO_BATCH);
+        const results = await Promise.allSettled(
+          batch.map(m =>
+            Promise.race([
+              fetchMovieDetailViaTab(token, m.uuid),
+              new Promise(r => setTimeout(() => r(null), WO_TIMEOUT))
+            ])
+          )
+        );
+        results.forEach((res, j) => {
+          const m    = batch[j];
+          const data = res.status === "fulfilled" ? res.value : null;
+          if (data) {
+            m.meta = data?.data ?? data;
+          } else {
+            woRetryList.push(m);
+          }
+        });
+      }
+
+      // Retry — up to 3 rounds
+      let woAttempts = 0;
+      while (woRetryList.length > 0 && woAttempts < 3) {
+        throwIfCancelled();
+        woAttempts++;
+        const stillFailed = [];
+        for (let i = 0; i < woRetryList.length; i += WO_BATCH) {
+          throwIfCancelled();
+          const batch   = woRetryList.slice(i, i + WO_BATCH);
+          const results = await Promise.allSettled(
+            batch.map(m =>
+              Promise.race([
+                fetchMovieDetailViaTab(token, m.uuid),
+                new Promise(r => setTimeout(() => r(null), WO_TIMEOUT))
+              ])
+            )
+          );
+          results.forEach((res, j) => {
+            const m    = batch[j];
+            const data = res.status === "fulfilled" ? res.value : null;
+            if (data) { m.meta = data?.data ?? data; }
+            else       { stillFailed.push(m); }
+          });
+        }
+        woRetryList = stillFailed;
+      }
+      // Remaining failures: meta stays absent → title=null → caught by failedMovies.
+    }
+
+    const moviesRaw = [...moviesFollowsRaw, ...watchOnlyMovies];
 
     const showsRaw = [...seriesRaw, ...animeRaw];
     exportState.loaded     = showsRaw.length;
-    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies fetched`;
+    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesFollowsRaw.length.toLocaleString()} followed + ${watchOnlyMovies.length.toLocaleString()} watch-only movies fetched`;
 
     // -------------------------------------------------------------------------
     // Étape 2 — Historique de visionnage (épisodes + films)
@@ -499,7 +585,7 @@ async function runExport(userId, token, tabId) {
     );
     const filteredWatches = episodeWatches.filter(w => followedSeriesUuids.has(w.series_uuid));
 
-    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies · ${filteredWatches.length.toLocaleString()} eps fetched`;
+    exportState.fetchCount = `${showsRaw.length.toLocaleString()} shows · ${moviesRaw.length.toLocaleString()} movies (${moviesFollowsRaw.length.toLocaleString()} followed + ${watchOnlyMovies.length.toLocaleString()} watch-only) · ${filteredWatches.length.toLocaleString()} eps fetched`;
 
     // Index watched_at — double clé (episode_id, uuid) pour couvrir tous les formats
     const watchedAtMap = new Map();
