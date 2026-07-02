@@ -262,20 +262,59 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
 // pour reconstituer la structure { seasons: [{ number, episodes: [...] }] }
 // que la suite du pipeline attend déjà.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Shared sidecar fetch with retry on transient 5xx (502/503/504).
+// TV Time's backend is winding down and returns intermittent 502 Bad Gateway
+// on individual requests. The paginated fetch (fetchObjectsViaTab) already
+// retries, but the single-shot detail endpoints (episodes, movie details,
+// favorites, lists) previously gave up on the first failure. Retry them up to
+// 3 times with exponential backoff (1s, 2s, 4s). 4xx (auth/not-found) returns
+// immediately — retrying a permanent failure only hammers the API. Network
+// errors are retried too. Returns the Response on success, or null once
+// retries are exhausted (callers already treat null as "this item failed").
+// ---------------------------------------------------------------------------
+const SIDECAR_HEADERS = token => ({
+  "Authorization":  "Bearer " + token,
+  "App-Version":    "2025082201",
+  "Client-Version": "10.10.0"
+});
+
+async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar" } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let r;
+    try {
+      r = await fetch(url, { headers: SIDECAR_HEADERS(token) });
+    } catch (netErr) {
+      if (attempt >= retries) {
+        console.error(`[TVTO] ${label}: network error after ${retries} retries — ${netErr.message}`);
+        return null;
+      }
+      await sleep(1000 * Math.pow(2, attempt));
+      continue;
+    }
+    if (r.ok) return r;
+    if (r.status >= 400 && r.status < 500) {
+      console.error(`[TVTO] ${label}: HTTP ${r.status} (not retried)`);
+      return null; // 4xx is permanent — don't retry
+    }
+    // 5xx (502/503/504…) — retry with backoff unless exhausted.
+    if (attempt >= retries) {
+      console.error(`[TVTO] ${label}: HTTP ${r.status} — gave up after ${retries} retries`);
+      return null;
+    }
+    console.warn(`[TVTO] ${label}: HTTP ${r.status}, retry ${attempt + 1}/${retries} in ${1000 * Math.pow(2, attempt)}ms`);
+    await sleep(1000 * Math.pow(2, attempt));
+  }
+  return null;
+}
+
 async function fetchSingleViaTab(token, seriesId) {
   const innerUrl = `https://msapi.tvtime.com/v1/series/${seriesId}/episodes`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  const response = await fetch(url, {
-    headers: {
-      "Authorization": "Bearer " + token,
-      "App-Version": "2025082201",
-      "Client-Version": "10.10.0"
-    }
-  });
-
-  if (!response.ok) return null;
-  const raw = await response.json();
+  const response = await fetchSidecarWithRetry(url, token, { label: `series ${seriesId} episodes` });
+  if (!response) return null;
+  const raw = await response.json().catch(() => null);
   if (!raw?.data) return null;
 
   const seasonMap = new Map();
@@ -299,21 +338,11 @@ async function fetchFavoritesList(token, userId, listKey, idField = "id") {
   const innerUrl = `https://msapi.tvtime.com/prod/v2/lists/user/${userId}/lists/${listKey}`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "Authorization": "Bearer " + token,
-        "App-Version": "2025082201",
-        "Client-Version": "10.10.0"
-      }
-    });
-    if (!response.ok) return [];
-    const raw = await response.json();
-    const objects = raw?.data?.objects ?? raw?.objects ?? [];
-    return objects.map(o => o?.[idField]).filter(v => v != null);
-  } catch (_) {
-    return [];
-  }
+  const response = await fetchSidecarWithRetry(url, token, { label: `favorites ${listKey}` });
+  if (!response) return [];
+  const raw = await response.json().catch(() => null);
+  const objects = raw?.data?.objects ?? raw?.objects ?? [];
+  return objects.map(o => o?.[idField]).filter(v => v != null);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,13 +392,8 @@ async function fetchListsViaTab(token, userId) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
 
-  const r    = await fetch(sidecarUrl, {
-    headers: {
-      "Authorization":  "Bearer " + token,
-      "App-Version":    "2025082201",
-      "Client-Version": "10.10.0"
-    }
-  });
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "user lists" });
+  if (!r) return [];
   const text = await r.text();
   let raw;
   try {
@@ -393,19 +417,10 @@ async function fetchMovieDetailViaTab(token, uuid) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
 
-  try {
-    const r    = await fetch(sidecarUrl, {
-      headers: {
-        "Authorization":  "Bearer " + token,
-        "App-Version":    "2025082201",
-        "Client-Version": "10.10.0"
-      }
-    });
-    const data = await r.json();
-    return data ?? null;
-  } catch (_) {
-    return null;
-  }
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: `movie ${uuid}` });
+  if (!r) return null;
+  const data = await r.json().catch(() => null);
+  return data ?? null;
 }
 
 // ---------------------------------------------------------------------------
