@@ -388,9 +388,13 @@ async function init() {
     if (data.exportFormat) formatSelect.value = data.exportFormat;
   });
 
-  // Restore previously saved ZIP-bundle preference (default: off)
+  // Restore previously saved ZIP-bundle preference (default: on).
+  // Bundling every output into a single .zip is the least confusing path for
+  // new users — several Discord reports were people who received the CSV/JSON
+  // files individually and thought the export "only downloaded one file".
+  // Existing users who explicitly turned it off keep zipBundle === false.
   chrome.storage.local.get("zipBundle", (data) => {
-    zipToggle.checked = data.zipBundle ?? false;
+    zipToggle.checked = data.zipBundle ?? true;
   });
 
   const credentials = await ensureCredentials();
