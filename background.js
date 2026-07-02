@@ -979,6 +979,21 @@ async function runExport(userId, token, tabId) {
       }, 0)
     , 0);
 
+    // Empty-export guard — an export that came back with zero shows AND zero
+    // movies is never a real "success". It almost always means the JWT expired
+    // mid-run or the sidecar answered 4xx/5xx: the follows/watch fetches return
+    // [] and the pipeline otherwise completes with "Great success!" and 0/0/0.
+    // Fail loudly instead so the user knows to retry rather than trusting an
+    // empty file. (Lists alone don't count — without shows or movies there is
+    // nothing worth exporting.)
+    if (shows.length === 0 && movies.length === 0) {
+      throw new Error(
+        "Export returned no shows and no movies. Your TV Time session likely " +
+        "expired or the server is temporarily unavailable. Reload app.tvtime.com, " +
+        "make sure you're logged in, then try again."
+      );
+    }
+
     const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime, zipBundle: exportState.zipBundle };
 
     // Carry zipBundle/format from the running state into the done state so
