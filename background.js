@@ -40,8 +40,53 @@ let exportState = {
   result:     null,     // { shows, movies, lists } quand done
   error:      null,
   format:     "json",   // "json" | "csv" | "both" — passed from popup at START_EXPORT
-  zipBundle:  false     // true → bundle all outputs into a single .zip download
+  zipBundle:  false,    // true → bundle all outputs into a single .zip download
+  errors:     []        // human-readable log lines surfaced in the popup (see recordExportError)
 };
+
+// ---------------------------------------------------------------------------
+// Export error log — collected during a run and surfaced in the popup so users
+// (and Discord support) can see what went wrong without opening the service
+// worker console. Every entry is also mirrored to console.error with the
+// [TVTO] prefix. Reset at the start of each export (runExport).
+// ---------------------------------------------------------------------------
+let exportErrors = [];
+const MAX_EXPORT_ERRORS = 200; // cap so a pathological run can't grow unbounded
+
+function recordExportError(msg) {
+  const ts   = new Date().toISOString().substring(11, 19); // HH:MM:SS
+  const line = `[${ts}] ${msg}`;
+  exportErrors.push(line);
+  if (exportErrors.length > MAX_EXPORT_ERRORS) exportErrors.shift();
+  console.error("[TVTO]", msg);
+}
+
+// Translate an HTTP status into a short, user-facing reason. TV Time's sidecar
+// commonly returns 502/503/504 while the backend winds down; surfacing that
+// plainly means a "JSON parse error" (HTML error page) isn't mistaken for a
+// bug in the export itself.
+function describeHttpStatus(status) {
+  if (status === 401 || status === 403) return `HTTP ${status} (session expired — reload app.tvtime.com)`;
+  if (status === 429)                   return `HTTP 429 (rate limited)`;
+  if (status === 502 || status === 503 || status === 504)
+    return `HTTP ${status} (TV Time server temporarily unavailable)`;
+  return `HTTP ${status}`;
+}
+
+// Per-run tally of HTTP failures, keyed by status code (or "network"). Feeds
+// the end-of-run failure summaries ("… most common error: HTTP 502"). Reset at
+// the start of each export. lastSidecarFailure holds the most recent failure so
+// single-shot calls (e.g. custom lists) can report their exact status.
+let httpFailureTally  = {};
+let lastSidecarFailure = null; // { status } | { network: true }
+function tallyHttpFailure(key) { httpFailureTally[key] = (httpFailureTally[key] ?? 0) + 1; }
+function dominantFailureReason() {
+  const entries = Object.entries(httpFailureTally);
+  if (!entries.length) return null;
+  entries.sort((a, b) => b[1] - a[1]);
+  const [key] = entries[0];
+  return key === "network" ? "network errors" : describeHttpStatus(Number(key));
+}
 
 // ---------------------------------------------------------------------------
 // Lecture des credentials depuis le storage persistant au démarrage
@@ -198,11 +243,11 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
       text = await r.text().catch(() => "");
       if (r.ok) break;
       if (r.status >= 400 && r.status < 500) {
-        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — url: ${url} — body: ${text.slice(0, 200)}`);
+        recordExportError(`${entityType} page @${pageOffset}: ${describeHttpStatus(r.status)} — stopping.`);
         break pageLoop; // 4xx: return whatever we've collected so far
       }
       if (attempt >= MAX_RETRIES) {
-        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — exhausted ${MAX_RETRIES} retries, skipping page — url: ${url} — body: ${text.slice(0, 200)}`);
+        recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} — exhausted ${MAX_RETRIES} retries, skipping page`);
         consecutiveFails++;
         if (consecutiveFails >= MAX_CONSEC_FAILS) { break pageLoop; }
         pageOffset += pageLimit;
@@ -223,7 +268,7 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     try {
       data = JSON.parse(text);
     } catch (jsonErr) {
-      console.error(`[TVTO] fetchObjectsViaTab JSON parse error at offset ${pageOffset}: ${jsonErr.message} — skipping page — raw: ${text.slice(0, 200)}`);
+      recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} but response was not valid JSON (${jsonErr.message}) — skipping page`);
       consecutiveFails++;
       if (consecutiveFails >= MAX_CONSEC_FAILS) break pageLoop;
       pageOffset += pageLimit;
@@ -248,30 +293,18 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch épisodes d'une série via msapi.tvtime.com (un seul appel renvoie
-// TOUS les épisodes, toutes saisons confondues).
-//
-// Endpoint : GET https://msapi.tvtime.com/v1/series/{seriesId}/episodes
-// seriesId = TV Time show ID (show.id dans la réponse follows), PAS le TVDB ID.
-//
-// Réponse : { status: "success", data: [{ id, number, name, is_special,
-//                                          season: { number } }, ...] }
-//
-// Exécuté directement depuis le service worker (plus de MAIN world /
-// executeScript / polling). On regroupe la liste plate par season.number
-// pour reconstituer la structure { seasons: [{ number, episodes: [...] }] }
-// que la suite du pipeline attend déjà.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Shared sidecar fetch with retry on transient 5xx (502/503/504).
 // TV Time's backend is winding down and returns intermittent 502 Bad Gateway
 // on individual requests. The paginated fetch (fetchObjectsViaTab) already
 // retries, but the single-shot detail endpoints (episodes, movie details,
-// favorites, lists) previously gave up on the first failure. Retry them up to
-// 3 times with exponential backoff (1s, 2s, 4s). 4xx (auth/not-found) returns
-// immediately — retrying a permanent failure only hammers the API. Network
-// errors are retried too. Returns the Response on success, or null once
-// retries are exhausted (callers already treat null as "this item failed").
+// favorites, lists) previously gave up on the first failure — so one transient
+// 502 permanently dropped that item. Retry up to 3 times with exponential
+// backoff (1s, 2s, 4s); 4xx (auth/not-found) returns immediately — retrying a
+// permanent failure only hammers the API. Network errors are retried too.
+// Returns the Response on success or null once exhausted (callers already
+// treat null as "this item failed"). Per-item failures are tallied and logged
+// to the console; the popup panel gets concise end-of-run summaries instead of
+// one noisy line per failed item.
 // ---------------------------------------------------------------------------
 const SIDECAR_HEADERS = token => ({
   "Authorization":  "Bearer " + token,
@@ -286,6 +319,8 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
       r = await fetch(url, { headers: SIDECAR_HEADERS(token) });
     } catch (netErr) {
       if (attempt >= retries) {
+        tallyHttpFailure("network");
+        lastSidecarFailure = { network: true };
         console.error(`[TVTO] ${label}: network error after ${retries} retries — ${netErr.message}`);
         return null;
       }
@@ -294,12 +329,16 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
     }
     if (r.ok) return r;
     if (r.status >= 400 && r.status < 500) {
-      console.error(`[TVTO] ${label}: HTTP ${r.status} (not retried)`);
+      tallyHttpFailure(r.status);
+      lastSidecarFailure = { status: r.status };
+      console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — not retried`);
       return null; // 4xx is permanent — don't retry
     }
     // 5xx (502/503/504…) — retry with backoff unless exhausted.
     if (attempt >= retries) {
-      console.error(`[TVTO] ${label}: HTTP ${r.status} — gave up after ${retries} retries`);
+      tallyHttpFailure(r.status);
+      lastSidecarFailure = { status: r.status };
+      console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — gave up after ${retries} retries`);
       return null;
     }
     console.warn(`[TVTO] ${label}: HTTP ${r.status}, retry ${attempt + 1}/${retries} in ${1000 * Math.pow(2, attempt)}ms`);
@@ -308,6 +347,21 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Fetch épisodes d'une série via msapi.tvtime.com (un seul appel renvoie
+// TOUS les épisodes, toutes saisons confondues).
+//
+// Endpoint : GET https://msapi.tvtime.com/v1/series/{seriesId}/episodes
+// seriesId = TV Time show ID (show.id dans la réponse follows), PAS le TVDB ID.
+//
+// Réponse : { status: "success", data: [{ id, number, name, is_special,
+//                                          season: { number } }, ...] }
+//
+// Exécuté directement depuis le service worker (plus de MAIN world /
+// executeScript / polling). On regroupe la liste plate par season.number
+// pour reconstituer la structure { seasons: [{ number, episodes: [...] }] }
+// que la suite du pipeline attend déjà.
+// ---------------------------------------------------------------------------
 async function fetchSingleViaTab(token, seriesId) {
   const innerUrl = `https://msapi.tvtime.com/v1/series/${seriesId}/episodes`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
@@ -392,15 +446,25 @@ async function fetchListsViaTab(token, userId) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
 
-  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "user lists" });
-  if (!r) return [];
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "custom lists" });
+  if (!r) {
+    // Non-ok / network failure — the helper already tallied + logged the status.
+    // Surface one panel line so the user knows lists were skipped and why.
+    const why = lastSidecarFailure?.network ? "network error"
+              : lastSidecarFailure?.status  ? describeHttpStatus(lastSidecarFailure.status)
+              : "request failed";
+    recordExportError(`Custom lists skipped — ${why}.`);
+    return [];
+  }
   const text = await r.text();
   let raw;
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    console.error("[TVTO] fetchListsViaTab JSON parse error:", e.message, "— raw start:", text.slice(0, 150));
-    throw new Error(e.message);
+    // 200 OK but the body wasn't JSON (e.g. an HTML error page). Include the
+    // HTTP status so this reads as a server issue, not a parsing bug.
+    recordExportError(`Custom lists skipped — HTTP ${r.status} but response was not valid JSON (${e.message}).`);
+    return [];
   }
   if (Array.isArray(raw))       return raw;
   if (Array.isArray(raw?.data)) return raw.data;
@@ -438,6 +502,8 @@ async function fetchMovieDetailViaTab(token, uuid) {
 // ---------------------------------------------------------------------------
 async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
+  exportErrors = []; // fresh log for this run
+  httpFailureTally = {}; lastSidecarFailure = null;
   const cgwBase    = "https://msapi.tvtime.com/prod/v1/tracking/cgw/follows/user/" + userId;
   const watchesBase= "https://msapi.tvtime.com/prod/v1/tracking/watches/user/"     + userId;
 
@@ -958,9 +1024,11 @@ async function runExport(userId, token, tabId) {
 
     let listsRaw = [];
     try {
+      // fetchListsViaTab reports its own failures to the panel and returns [];
+      // this catch is a safety net for anything unexpected (no duplicate log).
       listsRaw = await fetchListsViaTab(token, userId);
     } catch (listsErr) {
-      console.error("[TVTO BG] fetchListsViaTab failed (non-fatal):", listsErr.message);
+      recordExportError(`Custom lists skipped — ${listsErr.message}`);
     }
 
     const lists = listsRaw.map(list => ({
@@ -1009,6 +1077,17 @@ async function runExport(userId, token, tabId) {
       );
     }
 
+    // Summarise partial failures into the error log so they surface in the
+    // popup alongside any transient fetch errors already recorded.
+    if (finalFailed.length > 0) {
+      const reason = dominantFailureReason();
+      recordExportError(`${finalFailed.length} series could not be fully fetched (missing seasons/episodes)${reason ? ` — most common error: ${reason}` : ""}.`);
+    }
+    if (failedMovies.length > 0) {
+      const reason = dominantFailureReason();
+      recordExportError(`${failedMovies.length} movie(s) could not be exported (no metadata)${reason ? ` — most common error: ${reason}` : ""}.`);
+    }
+
     const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime, zipBundle: exportState.zipBundle };
 
     // Carry zipBundle/format from the running state into the done state so
@@ -1023,7 +1102,8 @@ async function runExport(userId, token, tabId) {
       result,
       error:     null,
       format:    exportState.format,
-      zipBundle: exportState.zipBundle
+      zipBundle: exportState.zipBundle,
+      errors:    exportErrors.slice()
     };
 
     // ─── Download: ZIP bundle vs. separate HTML summary ──────────────────────
@@ -1058,7 +1138,7 @@ async function runExport(userId, token, tabId) {
           saveAs:   false
         });
       } catch (zipErr) {
-        console.error("[TVTO BG] ZIP bundling failed:", zipErr);
+        recordExportError(`ZIP bundling failed: ${zipErr.message ?? String(zipErr)}`);
         // Surface the failure to the popup so the user isn't left with no download.
         exportState = {
           status: "error",
@@ -1068,7 +1148,8 @@ async function runExport(userId, token, tabId) {
           result: null,
           error:  `ZIP bundling failed: ${zipErr.message ?? String(zipErr)}`,
           format: exportState.format,
-          zipBundle: exportState.zipBundle
+          zipBundle: exportState.zipBundle,
+          errors: exportErrors.slice()
         };
       }
     } else {
@@ -1100,14 +1181,15 @@ async function runExport(userId, token, tabId) {
       console.log("[TVTO BG] Export cancelled by user.");
       return;
     }
+    recordExportError(`Export aborted: ${err.message ?? String(err)}`);
     exportState = {
       status: "error",
       step:   null,
       loaded: exportState.loaded,
       total:  null,
       result: null,
-      error:  err.message ?? String(err)
+      error:  err.message ?? String(err),
+      errors: exportErrors.slice()
     };
-    console.error("[TVTO BG] Erreur export :", err);
   }
 }
