@@ -25,6 +25,9 @@ const warningBar       = document.getElementById("warning-bar");
 const warningBarMovies = document.getElementById("warning-bar-movies");
 const formatSelect     = document.getElementById("format-select");
 const zipToggle        = document.getElementById("zip-toggle");
+const errorLog         = document.getElementById("error-log");
+const errorLogSummary  = document.getElementById("error-log-summary");
+const errorLogContent  = document.getElementById("error-log-content");
 
 // ---------------------------------------------------------------------------
 // Local state
@@ -84,6 +87,22 @@ function resetToIdle() {
   btnExport.disabled = false;
   hideCancelButton();
   hideProgress();
+}
+
+// Render the collected export error log into the collapsible panel. Hidden
+// (and cleared) when there are no errors. Stays collapsed by default — users
+// only expand it if they hit a problem worth reporting.
+function renderErrorLog(errors) {
+  const lines = Array.isArray(errors) ? errors : [];
+  if (!lines.length) {
+    errorLog.classList.remove("visible");
+    errorLog.open = false;
+    errorLogContent.textContent = "";
+    return;
+  }
+  errorLogContent.textContent = lines.join("\n");
+  errorLogSummary.textContent = `Details (${lines.length} issue${lines.length === 1 ? "" : "s"})`;
+  errorLog.classList.add("visible");
 }
 
 function showCancelButton() {
@@ -289,6 +308,9 @@ function handleExportDone(state) {
     warningBarMovies.classList.remove("visible");
   }
 
+  // Error log — collapsed by default; shows any issues collected during the run.
+  renderErrorLog(state?.errors);
+
   // Auto-download — no user click required.
   // When zipBundle is true the service worker already produced a single zip
   // via chrome.downloads.download; the popup must not call downloadAll().
@@ -353,6 +375,7 @@ function handleExportState(state) {
       stopTimer();
       resetToIdle();
       setStatus(`Error: ${state.error}`, "error");
+      renderErrorLog(state.errors);
       break;
 
     default:
@@ -472,6 +495,7 @@ btnExport.addEventListener("click", async () => {
   }
 
   setStatus("Starting export…", "running", true);
+  renderErrorLog([]); // clear any log from a previous run
   btnExport.disabled = true;
   showCancelButton();
   showProgress();

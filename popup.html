@@ -257,6 +257,41 @@
     #warning-bar.visible,
     #warning-bar-movies.visible { display: block; }
 
+    /* Error log — collapsible, collapsed by default. Populated on done/error
+       so users can see what went wrong without opening the SW console. */
+    #error-log {
+      display: none;
+      margin-top: 10px;
+      font-size: 0.72rem;
+      background: rgba(231, 76, 60, 0.08);
+      border: 1px solid rgba(231, 76, 60, 0.3);
+      border-radius: 6px;
+    }
+    #error-log.visible { display: block; }
+    #error-log summary {
+      cursor: pointer;
+      padding: 7px 12px;
+      color: var(--error);
+      font-weight: 600;
+      list-style: none;
+      user-select: none;
+    }
+    #error-log summary::-webkit-details-marker { display: none; }
+    #error-log summary::before { content: "▸ "; }
+    #error-log[open] summary::before { content: "▾ "; }
+    #error-log-content {
+      margin: 0;
+      padding: 0 12px 10px;
+      max-height: 160px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.68rem;
+      color: #d8a9a2;
+      line-height: 1.45;
+    }
+
     /* Divider + footer */
     .divider {
       height: 1px;
@@ -343,6 +378,11 @@
 
   <div id="warning-bar"></div>
   <div id="warning-bar-movies"></div>
+
+  <details id="error-log">
+    <summary id="error-log-summary">Details</summary>
+    <pre id="error-log-content"></pre>
+  </details>
 
   <div class="divider"></div>
   <div class="footer">100% client-side &mdash; no data leaves your browser</div>
