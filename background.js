@@ -14,6 +14,7 @@
  */
 
 import { buildSummaryHtml, buildFilesList } from './exporter.js';
+import { buildMovieWatchedMap, resolveMovieWatchState } from './apiClient.js';
 
 // JSZip is a UMD bundle. The manifest declares this service worker as
 // "type": "module", which makes importScripts() unavailable — module workers
@@ -814,7 +815,10 @@ async function runExport(userId, token, tabId) {
       }))
     }));
 
-    // Films — cgwBase source unique : métadonnées + statut vu + watched_at
+    // Films — métadonnées depuis follows/détail ; statut vu + watched_at depuis
+    // l'endpoint *watches* (les autres endpoints ne le portent pas). Indexé par
+    // uuid, comme watchedAtMap pour les épisodes.
+    const movieWatchedMap = buildMovieWatchedMap(movieWatchesRaw);
     const movies = moviesRaw.map(m => {
       // Cherche les métadonnées dans les emplacements connus
       const meta       = m.meta ?? m.content ?? m.movie ?? m.data ?? m ?? {};
@@ -823,16 +827,20 @@ async function runExport(userId, token, tabId) {
       const tvdbId     = tvdbSource ? parseInt(tvdbSource.id) : (meta?.tvdb_id ?? meta?.id_tvdb ?? null);
       const imdbId     = meta?.imdb_id ?? meta?.id_imdb ?? null;
       const title      = meta?.name ?? meta?.title ?? meta?.original_name ?? null;
+      const watch      = resolveMovieWatchState(m, meta, movieWatchedMap);
+      // Movies use ISO-Z ("YYYY-MM-DDTHH:MM:SSZ"); episodes use the space form.
+      // Keep both matching the converter's "TV Time Liberator" output exactly.
+      const watchedSpace = formatWatchedAt(watch.watched_at);
       return {
         id:         { tvdb: tvdbId, imdb: imdbId },
         uuid:       m.uuid,
         created_at: m.created_at,
         title,
         year:          null, // populated in Step 4/5
-        watched_at:    m.watched_at ?? null,
-        is_watched:    m.extended?.is_watched ?? meta?.is_watched ?? false,
+        watched_at:    watchedSpace ? watchedSpace.replace(" ", "T") + "Z" : null,
+        is_watched:    watch.is_watched,
         is_favorite:   favoriteMoviesIds.has(m.uuid),
-        rewatch_count: m.rewatch_count ?? 0
+        rewatch_count: watch.rewatch_count
       };
     });
 

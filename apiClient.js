@@ -94,6 +94,44 @@ export function hasNextPage(batch) {
  * @param {object} obj  Objet brut depuis data.data.objects[]
  * @returns {{id, name, status, entity_type, created_at, updated_at}}
  */
+/**
+ * Construit une table uuid → { watched_at, rewatch_count } depuis les objets de
+ * l'endpoint *watches* films. Les endpoints follows / détail ne portent PAS le
+ * statut de visionnage : cette table en est la source faisant autorité (comme
+ * `watchedAtMap` pour les épisodes).
+ *
+ * @param {Array} movieWatchesRaw  objets bruts de watches/movie
+ * @returns {Map<string,{watched_at:(string|null),rewatch_count:number}>}
+ */
+export function buildMovieWatchedMap(movieWatchesRaw) {
+  const map = new Map();
+  for (const w of movieWatchesRaw ?? []) {
+    if (!w?.uuid) continue;
+    map.set(String(w.uuid), { watched_at: w.watched_at ?? null, rewatch_count: w.rewatch_count ?? 0 });
+  }
+  return map;
+}
+
+/**
+ * Résout le statut de visionnage d'un film. Priorité à la table watches (par
+ * uuid) ; repli sur un éventuel flag is_watched porté par l'objet brut ou ses
+ * métadonnées (rétrocompat). Ne fabrique jamais de date.
+ *
+ * @param {object} rawMovie  objet brut (follows ou watches)
+ * @param {object} meta      métadonnées extraites (détail film)
+ * @param {Map} watchedMap   sortie de buildMovieWatchedMap
+ * @returns {{is_watched:boolean, watched_at:(string|null), rewatch_count:number}}
+ */
+export function resolveMovieWatchState(rawMovie, meta, watchedMap) {
+  const entry   = rawMovie?.uuid ? watchedMap.get(String(rawMovie.uuid)) : null;
+  const flagged = rawMovie?.extended?.is_watched ?? meta?.is_watched ?? false;
+  return {
+    is_watched:    !!entry || !!flagged,
+    watched_at:    entry?.watched_at ?? rawMovie?.watched_at ?? null,
+    rewatch_count: entry?.rewatch_count ?? rawMovie?.rewatch_count ?? 0,
+  };
+}
+
 export function normalizeShow(obj) {
   return {
     id:          obj.meta?.id                        ?? null,
