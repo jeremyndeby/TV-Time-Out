@@ -388,9 +388,9 @@ async function init() {
     if (data.exportFormat) formatSelect.value = data.exportFormat;
   });
 
-  // Restore previously saved ZIP-bundle preference (default: off)
+  // Restore previously saved ZIP-bundle preference (default: on)
   chrome.storage.local.get("zipBundle", (data) => {
-    zipToggle.checked = data.zipBundle ?? false;
+    zipToggle.checked = data.zipBundle ?? true;
   });
 
   const credentials = await ensureCredentials();
