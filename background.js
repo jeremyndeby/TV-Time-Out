@@ -71,6 +71,7 @@ function describeHttpStatus(status) {
   if (status === 429)                   return `HTTP 429 (rate limited)`;
   if (status === 502 || status === 503 || status === 504)
     return `HTTP ${status} (TV Time server temporarily unavailable)`;
+  if (status === 599)                   return `HTTP 599 (request timed out after 60s)`;
   return `HTTP ${status}`;
 }
 
@@ -240,7 +241,13 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     const MAX_RETRIES = 5;
     let r, text;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      r = await fetch(url, { headers });
+      try {
+        r = await fetchWithTimeout(url, { headers });
+      } catch (fetchErr) {
+        // Timeout (AbortError) or network failure — synthesize a 5xx-like
+        // response so the existing retry/skip-and-continue logic applies.
+        r = { ok: false, status: 599, text: async () => `(${fetchErr.name ?? "network error"})` };
+      }
       text = await r.text().catch(() => "");
       if (r.ok) break;
       if (r.status >= 400 && r.status < 500) {
@@ -307,6 +314,21 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
 // to the console; the popup panel gets concise end-of-run summaries instead of
 // one noisy line per failed item.
 // ---------------------------------------------------------------------------
+// 60 s watchdog on every sidecar fetch — a hung connection aborts and is then
+// handled exactly like a transient 5xx by the callers' retry / skip-and-
+// continue logic (fetchObjectsViaTab synthesizes an HTTP 599 response;
+// fetchSidecarWithRetry's network-error path retries with backoff).
+const SIDECAR_TIMEOUT_MS = 60000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = SIDECAR_TIMEOUT_MS) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const SIDECAR_HEADERS = token => ({
   "Authorization":  "Bearer " + token,
   "App-Version":    "2025082201",
@@ -317,7 +339,7 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
   for (let attempt = 0; attempt <= retries; attempt++) {
     let r;
     try {
-      r = await fetch(url, { headers: SIDECAR_HEADERS(token) });
+      r = await fetchWithTimeout(url, { headers: SIDECAR_HEADERS(token) });
     } catch (netErr) {
       if (attempt >= retries) {
         tallyHttpFailure("network");
@@ -367,7 +389,7 @@ async function fetchSingleViaTab(token, seriesId) {
   const innerUrl = `https://msapi.tvtime.com/v1/series/${seriesId}/episodes`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  const response = await fetchSidecarWithRetry(url, token, { label: `series ${seriesId} episodes` });
+  const response = await fetchSidecarWithRetry(url, token, { retries: 1, label: `series ${seriesId} episodes` });
   if (!response) return null;
   const raw = await response.json().catch(() => null);
   if (!raw?.data) return null;
@@ -413,7 +435,9 @@ function formatWatchedAt(raw) {
   // Remplace le T par un espace et coupe tout ce qui suit les secondes
   const s = raw.replace("T", " ").replace(/(\d{2}:\d{2}:\d{2}).*$/, "$1");
   // Vérifie qu'on obtient bien "YYYY-MM-DD HH:MM:SS" (19 chars)
-  return s.length >= 19 ? s.substring(0, 19) : null;
+  if (s.length < 19) return null;
+  // ISO 8601 UTC — même format pour épisodes et films ("YYYY-MM-DDTHH:MM:SSZ").
+  return s.substring(0, 19).replace(" ", "T") + "Z";
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +506,7 @@ async function fetchMovieDetailViaTab(token, uuid) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
 
-  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: `movie ${uuid}` });
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { retries: 1, label: `movie ${uuid}` });
   if (!r) return null;
   const data = await r.json().catch(() => null);
   return data ?? null;
@@ -909,16 +933,13 @@ async function runExport(userId, token, tabId) {
       const imdbId     = meta?.imdb_id ?? meta?.id_imdb ?? null;
       const title      = meta?.name ?? meta?.title ?? meta?.original_name ?? null;
       const watch      = resolveMovieWatchState(m, meta, movieWatchedMap);
-      // Movies use ISO-Z ("YYYY-MM-DDTHH:MM:SSZ"); episodes use the space form.
-      // Keep both matching the converter's "TV Time Liberator" output exactly.
-      const watchedSpace = formatWatchedAt(watch.watched_at);
       return {
         id:         { tvdb: tvdbId, imdb: imdbId },
         uuid:       m.uuid,
         created_at: m.created_at,
         title,
         year:          null, // populated in Step 4/5
-        watched_at:    watchedSpace ? watchedSpace.replace(" ", "T") + "Z" : null,
+        watched_at:    formatWatchedAt(watch.watched_at),
         is_watched:    watch.is_watched,
         is_favorite:   favoriteMoviesIds.has(m.uuid),
         rewatch_count: watch.rewatch_count
@@ -1075,11 +1096,10 @@ async function runExport(userId, token, tabId) {
     // mid-run or the sidecar answered 4xx/5xx: the follows/watch fetches return
     // [] and the pipeline otherwise completes with "Great success!" and 0/0/0.
     // Fail loudly instead so the user knows to retry rather than trusting an
-    // empty file. (Lists alone don't count — without shows or movies there is
-    // nothing worth exporting.)
-    if (shows.length === 0 && movies.length === 0) {
+    // empty file. (A user with only custom lists still gets their export.)
+    if (shows.length === 0 && movies.length === 0 && lists.length === 0) {
       throw new Error(
-        "Export returned no shows and no movies. Your TV Time session likely " +
+        "Export returned no shows, no movies and no lists. Your TV Time session likely " +
         "expired or the server is temporarily unavailable. Reload app.tvtime.com, " +
         "make sure you're logged in, then try again."
       );
