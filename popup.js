@@ -215,25 +215,32 @@ async function getCredentialsFromTab() {
       const MAX_ATTEMPTS = 8; // 1 initial + 7 retries
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         for (const tab of candidates) {
-          const result = await new Promise((res) => {
-            chrome.scripting.executeScript(
-              { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
-              (results) => {
-                if (chrome.runtime.lastError) {
-                  console.error("[TVTO] executeScript failed on tab", tab.id,
-                    "(attempt", attempt, "of", MAX_ATTEMPTS, ")—",
-                    chrome.runtime.lastError.message);
-                  res(null); return;
+          // 5 s watchdog — executeScript into a frozen / unresponsive tab can
+          // leave its callback pending forever (same failure mode as the
+          // background token refresh). A timeout counts as "no token here"
+          // and the existing attempt/retry sweep moves on.
+          const result = await Promise.race([
+            new Promise((res) => {
+              chrome.scripting.executeScript(
+                { target: { tabId: tab.id }, world: "MAIN", func: readFunc },
+                (results) => {
+                  if (chrome.runtime.lastError) {
+                    console.error("[TVTO] executeScript failed on tab", tab.id,
+                      "(attempt", attempt, "of", MAX_ATTEMPTS, ")—",
+                      chrome.runtime.lastError.message);
+                    res(null); return;
+                  }
+                  const r = results?.[0]?.result;
+                  if (!r?.token) {
+                    console.error("[TVTO] executeScript ran but returned no token on tab", tab.id,
+                      "(attempt", attempt, "of", MAX_ATTEMPTS, ")— result:", JSON.stringify(r));
+                  }
+                  res(r?.token ? r : null);
                 }
-                const r = results?.[0]?.result;
-                if (!r?.token) {
-                  console.error("[TVTO] executeScript ran but returned no token on tab", tab.id,
-                    "(attempt", attempt, "of", MAX_ATTEMPTS, ")— result:", JSON.stringify(r));
-                }
-                res(r?.token ? r : null);
-              }
-            );
-          });
+              );
+            }),
+            new Promise((res) => setTimeout(() => res(null), 5000)),
+          ]);
           if (result) { resolve(result); return; }
         }
         if (attempt < MAX_ATTEMPTS) {

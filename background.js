@@ -448,13 +448,21 @@ function formatWatchedAt(raw) {
 // lifetime, and without a fresh token every watch-history / movie-detail
 // fetch silently returns 0 results.
 // ---------------------------------------------------------------------------
+const TOKEN_REFRESH_TIMEOUT_MS = 5000;
 async function getFreshToken(tabId) {
   try {
-    const result = await chrome.scripting.executeScript({
-      target: { tabId },
-      world:  "MAIN",
-      func:   () => localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "")
-    });
+    // 5 s watchdog — executeScript into a frozen / unresponsive tab can stay
+    // pending forever (never resolves, never rejects), which used to hang the
+    // whole export at a step boundary. A timeout resolves to null and every
+    // caller already treats null as "keep the existing token".
+    const result = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId },
+        world:  "MAIN",
+        func:   () => localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "")
+      }),
+      new Promise(resolve => setTimeout(() => resolve(null), TOKEN_REFRESH_TIMEOUT_MS))
+    ]);
     return result?.[0]?.result ?? null;
   } catch (_) {
     return null;
@@ -529,6 +537,12 @@ async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
   exportErrors = []; // fresh log for this run
   httpFailureTally = {}; lastSidecarFailure = null;
+
+  // Pin the TV Time tab for the duration of the export — Memory Saver
+  // discarding the tab mid-run hangs MAIN-world executeScript (token refresh)
+  // and drops the session the sidecar depends on. Restored in finally.
+  try { await chrome.tabs.update(tabId, { autoDiscardable: false }); }
+  catch (_) { /* tab already closed — the export will surface that on its own */ }
   const cgwBase    = "https://msapi.tvtime.com/prod/v1/tracking/cgw/follows/user/" + userId;
   const watchesBase= "https://msapi.tvtime.com/prod/v1/tracking/watches/user/"     + userId;
 
@@ -1219,5 +1233,9 @@ async function runExport(userId, token, tabId) {
       error:  err.message ?? String(err),
       errors: exportErrors.slice()
     };
+  } finally {
+    // Un-pin the tab whatever happened (success, error, cancel).
+    try { await chrome.tabs.update(tabId, { autoDiscardable: true }); }
+    catch (_) { /* tab closed — nothing to restore */ }
   }
 }
