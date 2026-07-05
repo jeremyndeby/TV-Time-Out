@@ -14,6 +14,7 @@
  */
 
 import { buildSummaryHtml, buildFilesList } from './exporter.js';
+import { buildMovieWatchedMap, resolveMovieWatchState } from './apiClient.js';
 
 // JSZip is a UMD bundle. The manifest declares this service worker as
 // "type": "module", which makes importScripts() unavailable — module workers
@@ -40,8 +41,53 @@ let exportState = {
   result:     null,     // { shows, movies, lists } quand done
   error:      null,
   format:     "json",   // "json" | "csv" | "both" — passed from popup at START_EXPORT
-  zipBundle:  false     // true → bundle all outputs into a single .zip download
+  zipBundle:  false,    // true → bundle all outputs into a single .zip download
+  errors:     []        // human-readable log lines surfaced in the popup (see recordExportError)
 };
+
+// ---------------------------------------------------------------------------
+// Export error log — collected during a run and surfaced in the popup so users
+// (and Discord support) can see what went wrong without opening the service
+// worker console. Every entry is also mirrored to console.error with the
+// [TVTO] prefix. Reset at the start of each export (runExport).
+// ---------------------------------------------------------------------------
+let exportErrors = [];
+const MAX_EXPORT_ERRORS = 200; // cap so a pathological run can't grow unbounded
+
+function recordExportError(msg) {
+  const ts   = new Date().toISOString().substring(11, 19); // HH:MM:SS
+  const line = `[${ts}] ${msg}`;
+  exportErrors.push(line);
+  if (exportErrors.length > MAX_EXPORT_ERRORS) exportErrors.shift();
+  console.error("[TVTO]", msg);
+}
+
+// Translate an HTTP status into a short, user-facing reason. TV Time's sidecar
+// commonly returns 502/503/504 while the backend winds down; surfacing that
+// plainly means a "JSON parse error" (HTML error page) isn't mistaken for a
+// bug in the export itself.
+function describeHttpStatus(status) {
+  if (status === 401 || status === 403) return `HTTP ${status} (session expired — reload app.tvtime.com)`;
+  if (status === 429)                   return `HTTP 429 (rate limited)`;
+  if (status === 502 || status === 503 || status === 504)
+    return `HTTP ${status} (TV Time server temporarily unavailable)`;
+  return `HTTP ${status}`;
+}
+
+// Per-run tally of HTTP failures, keyed by status code (or "network"). Feeds
+// the end-of-run failure summaries ("… most common error: HTTP 502"). Reset at
+// the start of each export. lastSidecarFailure holds the most recent failure so
+// single-shot calls (e.g. custom lists) can report their exact status.
+let httpFailureTally  = {};
+let lastSidecarFailure = null; // { status } | { network: true }
+function tallyHttpFailure(key) { httpFailureTally[key] = (httpFailureTally[key] ?? 0) + 1; }
+function dominantFailureReason() {
+  const entries = Object.entries(httpFailureTally);
+  if (!entries.length) return null;
+  entries.sort((a, b) => b[1] - a[1]);
+  const [key] = entries[0];
+  return key === "network" ? "network errors" : describeHttpStatus(Number(key));
+}
 
 // ---------------------------------------------------------------------------
 // Lecture des credentials depuis le storage persistant au démarrage
@@ -198,11 +244,11 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
       text = await r.text().catch(() => "");
       if (r.ok) break;
       if (r.status >= 400 && r.status < 500) {
-        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — url: ${url} — body: ${text.slice(0, 200)}`);
+        recordExportError(`${entityType} page @${pageOffset}: ${describeHttpStatus(r.status)} — stopping.`);
         break pageLoop; // 4xx: return whatever we've collected so far
       }
       if (attempt >= MAX_RETRIES) {
-        console.error(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset} — exhausted ${MAX_RETRIES} retries, skipping page — url: ${url} — body: ${text.slice(0, 200)}`);
+        recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} — exhausted ${MAX_RETRIES} retries, skipping page`);
         consecutiveFails++;
         if (consecutiveFails >= MAX_CONSEC_FAILS) { break pageLoop; }
         pageOffset += pageLimit;
@@ -223,7 +269,7 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     try {
       data = JSON.parse(text);
     } catch (jsonErr) {
-      console.error(`[TVTO] fetchObjectsViaTab JSON parse error at offset ${pageOffset}: ${jsonErr.message} — skipping page — raw: ${text.slice(0, 200)}`);
+      recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} but response was not valid JSON (${jsonErr.message}) — skipping page`);
       consecutiveFails++;
       if (consecutiveFails >= MAX_CONSEC_FAILS) break pageLoop;
       pageOffset += pageLimit;
@@ -248,6 +294,61 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared sidecar fetch with retry on transient 5xx (502/503/504).
+// TV Time's backend is winding down and returns intermittent 502 Bad Gateway
+// on individual requests. The paginated fetch (fetchObjectsViaTab) already
+// retries, but the single-shot detail endpoints (episodes, movie details,
+// favorites, lists) previously gave up on the first failure — so one transient
+// 502 permanently dropped that item. Retry up to 3 times with exponential
+// backoff (1s, 2s, 4s); 4xx (auth/not-found) returns immediately — retrying a
+// permanent failure only hammers the API. Network errors are retried too.
+// Returns the Response on success or null once exhausted (callers already
+// treat null as "this item failed"). Per-item failures are tallied and logged
+// to the console; the popup panel gets concise end-of-run summaries instead of
+// one noisy line per failed item.
+// ---------------------------------------------------------------------------
+const SIDECAR_HEADERS = token => ({
+  "Authorization":  "Bearer " + token,
+  "App-Version":    "2025082201",
+  "Client-Version": "10.10.0"
+});
+
+async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar" } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let r;
+    try {
+      r = await fetch(url, { headers: SIDECAR_HEADERS(token) });
+    } catch (netErr) {
+      if (attempt >= retries) {
+        tallyHttpFailure("network");
+        lastSidecarFailure = { network: true };
+        console.error(`[TVTO] ${label}: network error after ${retries} retries — ${netErr.message}`);
+        return null;
+      }
+      await sleep(1000 * Math.pow(2, attempt));
+      continue;
+    }
+    if (r.ok) return r;
+    if (r.status >= 400 && r.status < 500) {
+      tallyHttpFailure(r.status);
+      lastSidecarFailure = { status: r.status };
+      console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — not retried`);
+      return null; // 4xx is permanent — don't retry
+    }
+    // 5xx (502/503/504…) — retry with backoff unless exhausted.
+    if (attempt >= retries) {
+      tallyHttpFailure(r.status);
+      lastSidecarFailure = { status: r.status };
+      console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — gave up after ${retries} retries`);
+      return null;
+    }
+    console.warn(`[TVTO] ${label}: HTTP ${r.status}, retry ${attempt + 1}/${retries} in ${1000 * Math.pow(2, attempt)}ms`);
+    await sleep(1000 * Math.pow(2, attempt));
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Fetch épisodes d'une série via msapi.tvtime.com (un seul appel renvoie
 // TOUS les épisodes, toutes saisons confondues).
 //
@@ -266,16 +367,9 @@ async function fetchSingleViaTab(token, seriesId) {
   const innerUrl = `https://msapi.tvtime.com/v1/series/${seriesId}/episodes`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  const response = await fetch(url, {
-    headers: {
-      "Authorization": "Bearer " + token,
-      "App-Version": "2025082201",
-      "Client-Version": "10.10.0"
-    }
-  });
-
-  if (!response.ok) return null;
-  const raw = await response.json();
+  const response = await fetchSidecarWithRetry(url, token, { label: `series ${seriesId} episodes` });
+  if (!response) return null;
+  const raw = await response.json().catch(() => null);
   if (!raw?.data) return null;
 
   const seasonMap = new Map();
@@ -299,21 +393,11 @@ async function fetchFavoritesList(token, userId, listKey, idField = "id") {
   const innerUrl = `https://msapi.tvtime.com/prod/v2/lists/user/${userId}/lists/${listKey}`;
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "Authorization": "Bearer " + token,
-        "App-Version": "2025082201",
-        "Client-Version": "10.10.0"
-      }
-    });
-    if (!response.ok) return [];
-    const raw = await response.json();
-    const objects = raw?.data?.objects ?? raw?.objects ?? [];
-    return objects.map(o => o?.[idField]).filter(v => v != null);
-  } catch (_) {
-    return [];
-  }
+  const response = await fetchSidecarWithRetry(url, token, { label: `favorites ${listKey}` });
+  if (!response) return [];
+  const raw = await response.json().catch(() => null);
+  const objects = raw?.data?.objects ?? raw?.objects ?? [];
+  return objects.map(o => o?.[idField]).filter(v => v != null);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,20 +447,25 @@ async function fetchListsViaTab(token, userId) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
 
-  const r    = await fetch(sidecarUrl, {
-    headers: {
-      "Authorization":  "Bearer " + token,
-      "App-Version":    "2025082201",
-      "Client-Version": "10.10.0"
-    }
-  });
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "custom lists" });
+  if (!r) {
+    // Non-ok / network failure — the helper already tallied + logged the status.
+    // Surface one panel line so the user knows lists were skipped and why.
+    const why = lastSidecarFailure?.network ? "network error"
+              : lastSidecarFailure?.status  ? describeHttpStatus(lastSidecarFailure.status)
+              : "request failed";
+    recordExportError(`Custom lists skipped — ${why}.`);
+    return [];
+  }
   const text = await r.text();
   let raw;
   try {
     raw = JSON.parse(text);
   } catch (e) {
-    console.error("[TVTO] fetchListsViaTab JSON parse error:", e.message, "— raw start:", text.slice(0, 150));
-    throw new Error(e.message);
+    // 200 OK but the body wasn't JSON (e.g. an HTML error page). Include the
+    // HTTP status so this reads as a server issue, not a parsing bug.
+    recordExportError(`Custom lists skipped — HTTP ${r.status} but response was not valid JSON (${e.message}).`);
+    return [];
   }
   if (Array.isArray(raw))       return raw;
   if (Array.isArray(raw?.data)) return raw.data;
@@ -393,19 +482,10 @@ async function fetchMovieDetailViaTab(token, uuid) {
   const b64        = btoa(innerUrl).replace(/=/g, "");
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
 
-  try {
-    const r    = await fetch(sidecarUrl, {
-      headers: {
-        "Authorization":  "Bearer " + token,
-        "App-Version":    "2025082201",
-        "Client-Version": "10.10.0"
-      }
-    });
-    const data = await r.json();
-    return data ?? null;
-  } catch (_) {
-    return null;
-  }
+  const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: `movie ${uuid}` });
+  if (!r) return null;
+  const data = await r.json().catch(() => null);
+  return data ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +503,8 @@ async function fetchMovieDetailViaTab(token, uuid) {
 // ---------------------------------------------------------------------------
 async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
+  exportErrors = []; // fresh log for this run
+  httpFailureTally = {}; lastSidecarFailure = null;
   const cgwBase    = "https://msapi.tvtime.com/prod/v1/tracking/cgw/follows/user/" + userId;
   const watchesBase= "https://msapi.tvtime.com/prod/v1/tracking/watches/user/"     + userId;
 
@@ -814,7 +896,10 @@ async function runExport(userId, token, tabId) {
       }))
     }));
 
-    // Films — cgwBase source unique : métadonnées + statut vu + watched_at
+    // Films — métadonnées depuis follows/détail ; statut vu + watched_at depuis
+    // l'endpoint *watches* (les autres endpoints ne le portent pas). Indexé par
+    // uuid, comme watchedAtMap pour les épisodes.
+    const movieWatchedMap = buildMovieWatchedMap(movieWatchesRaw);
     const movies = moviesRaw.map(m => {
       // Cherche les métadonnées dans les emplacements connus
       const meta       = m.meta ?? m.content ?? m.movie ?? m.data ?? m ?? {};
@@ -823,16 +908,20 @@ async function runExport(userId, token, tabId) {
       const tvdbId     = tvdbSource ? parseInt(tvdbSource.id) : (meta?.tvdb_id ?? meta?.id_tvdb ?? null);
       const imdbId     = meta?.imdb_id ?? meta?.id_imdb ?? null;
       const title      = meta?.name ?? meta?.title ?? meta?.original_name ?? null;
+      const watch      = resolveMovieWatchState(m, meta, movieWatchedMap);
+      // Movies use ISO-Z ("YYYY-MM-DDTHH:MM:SSZ"); episodes use the space form.
+      // Keep both matching the converter's "TV Time Liberator" output exactly.
+      const watchedSpace = formatWatchedAt(watch.watched_at);
       return {
         id:         { tvdb: tvdbId, imdb: imdbId },
         uuid:       m.uuid,
         created_at: m.created_at,
         title,
         year:          null, // populated in Step 4/5
-        watched_at:    m.watched_at ?? null,
-        is_watched:    m.extended?.is_watched ?? meta?.is_watched ?? false,
+        watched_at:    watchedSpace ? watchedSpace.replace(" ", "T") + "Z" : null,
+        is_watched:    watch.is_watched,
         is_favorite:   favoriteMoviesIds.has(m.uuid),
-        rewatch_count: m.rewatch_count ?? 0
+        rewatch_count: watch.rewatch_count
       };
     });
 
@@ -943,9 +1032,11 @@ async function runExport(userId, token, tabId) {
 
     let listsRaw = [];
     try {
+      // fetchListsViaTab reports its own failures to the panel and returns [];
+      // this catch is a safety net for anything unexpected (no duplicate log).
       listsRaw = await fetchListsViaTab(token, userId);
     } catch (listsErr) {
-      console.error("[TVTO BG] fetchListsViaTab failed (non-fatal):", listsErr.message);
+      recordExportError(`Custom lists skipped — ${listsErr.message}`);
     }
 
     const lists = listsRaw.map(list => ({
@@ -979,6 +1070,32 @@ async function runExport(userId, token, tabId) {
       }, 0)
     , 0);
 
+    // Empty-export guard — an export that came back with zero shows AND zero
+    // movies is never a real "success". It almost always means the JWT expired
+    // mid-run or the sidecar answered 4xx/5xx: the follows/watch fetches return
+    // [] and the pipeline otherwise completes with "Great success!" and 0/0/0.
+    // Fail loudly instead so the user knows to retry rather than trusting an
+    // empty file. (Lists alone don't count — without shows or movies there is
+    // nothing worth exporting.)
+    if (shows.length === 0 && movies.length === 0) {
+      throw new Error(
+        "Export returned no shows and no movies. Your TV Time session likely " +
+        "expired or the server is temporarily unavailable. Reload app.tvtime.com, " +
+        "make sure you're logged in, then try again."
+      );
+    }
+
+    // Summarise partial failures into the error log so they surface in the
+    // popup alongside any transient fetch errors already recorded.
+    if (finalFailed.length > 0) {
+      const reason = dominantFailureReason();
+      recordExportError(`${finalFailed.length} series could not be fully fetched (missing seasons/episodes)${reason ? ` — most common error: ${reason}` : ""}.`);
+    }
+    if (failedMovies.length > 0) {
+      const reason = dominantFailureReason();
+      recordExportError(`${failedMovies.length} movie(s) could not be exported (no metadata)${reason ? ` — most common error: ${reason}` : ""}.`);
+    }
+
     const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime, zipBundle: exportState.zipBundle };
 
     // Carry zipBundle/format from the running state into the done state so
@@ -993,7 +1110,8 @@ async function runExport(userId, token, tabId) {
       result,
       error:     null,
       format:    exportState.format,
-      zipBundle: exportState.zipBundle
+      zipBundle: exportState.zipBundle,
+      errors:    exportErrors.slice()
     };
 
     // ─── Download: ZIP bundle vs. separate HTML summary ──────────────────────
@@ -1028,7 +1146,7 @@ async function runExport(userId, token, tabId) {
           saveAs:   false
         });
       } catch (zipErr) {
-        console.error("[TVTO BG] ZIP bundling failed:", zipErr);
+        recordExportError(`ZIP bundling failed: ${zipErr.message ?? String(zipErr)}`);
         // Surface the failure to the popup so the user isn't left with no download.
         exportState = {
           status: "error",
@@ -1038,7 +1156,8 @@ async function runExport(userId, token, tabId) {
           result: null,
           error:  `ZIP bundling failed: ${zipErr.message ?? String(zipErr)}`,
           format: exportState.format,
-          zipBundle: exportState.zipBundle
+          zipBundle: exportState.zipBundle,
+          errors: exportErrors.slice()
         };
       }
     } else {
@@ -1070,14 +1189,15 @@ async function runExport(userId, token, tabId) {
       console.log("[TVTO BG] Export cancelled by user.");
       return;
     }
+    recordExportError(`Export aborted: ${err.message ?? String(err)}`);
     exportState = {
       status: "error",
       step:   null,
       loaded: exportState.loaded,
       total:  null,
       result: null,
-      error:  err.message ?? String(err)
+      error:  err.message ?? String(err),
+      errors: exportErrors.slice()
     };
-    console.error("[TVTO BG] Erreur export :", err);
   }
 }
