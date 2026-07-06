@@ -24,7 +24,7 @@ let code = [
   extract(/let exportErrors = \[\];\nconst MAX_EXPORT_ERRORS[^\n]*\n/, "exportErrors"),
   extract(/function recordExportError\(msg\) \{[\s\S]*?\n\}/, "recordExportError"),
   extract(/const SIDECAR_TIMEOUT_MS = 60000;\nasync function fetchWithTimeout\([\s\S]*?\n\}/, "fetchWithTimeout"),
-  extract(/async function fetchObjectsViaTab\(token, innerUrl, entityType, pageLimit\) \{[\s\S]*?\n  return allObjects;\n\}/, "fetchObjectsViaTab"),
+  extract(/async function fetchObjectsViaTab\(token, innerUrl, entityType, pageLimit, onPage = null\) \{[\s\S]*?\n  return allObjects;\n\}/, "fetchObjectsViaTab"),
 ].join("\n\n");
 
 // scale timing constants (test speed only — logic untouched)

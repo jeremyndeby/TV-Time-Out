@@ -207,7 +207,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // Fetch paginé générique dans le MAIN world (via sidecar TV Time).
 // Token lu depuis localStorage avec suppression des guillemets JSON.
 // ---------------------------------------------------------------------------
-async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
+async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage = null) {
   const o_b64   = btoa(innerUrl).replace(/=/g, "");
   const base    = "https://app.tvtime.com/sidecar?o_b64=" + o_b64 +
                   "&entity_type=" + entityType + "&page_limit=" + pageLimit;
@@ -293,6 +293,13 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit) {
     lastFirstUuid    = firstUuid;
     consecutiveFails = 0; // successful page resets the consecutive-fail streak
 
+    // Progress feedback — long paginations (watch history can run hundreds of
+    // pages) must never look frozen. Guarded: a label callback must not be
+    // able to break the fetch.
+    if (onPage) {
+      try { onPage(Math.floor(pageOffset / pageLimit) + 1, allObjects.length); } catch (_) {}
+    }
+
     if (objects.length < pageLimit) break;
     pageOffset += pageLimit;
   }
@@ -329,6 +336,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = SIDECAR_TIMEOUT_M
   }
 }
 
+// Sentinel returned by fetchSidecarWithRetry on 4xx: the item is permanently
+// gone (deleted show/movie, bad id). Callers must report it as failed but
+// NEVER re-queue it — the 100/50-round retry floors only make sense for
+// transient failures (5xx/599/network).
+const PERMANENT_FAILURE = Symbol("permanent-4xx-failure");
+
 const SIDECAR_HEADERS = token => ({
   "Authorization":  "Bearer " + token,
   "App-Version":    "2025082201",
@@ -355,7 +368,7 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
       tallyHttpFailure(r.status);
       lastSidecarFailure = { status: r.status };
       console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — not retried`);
-      return null; // 4xx is permanent — don't retry
+      return PERMANENT_FAILURE; // 4xx is permanent — don't retry, don't re-queue
     }
     // 5xx (502/503/504…) — retry with backoff unless exhausted.
     if (attempt >= retries) {
@@ -390,6 +403,7 @@ async function fetchSingleViaTab(token, seriesId) {
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
   const response = await fetchSidecarWithRetry(url, token, { retries: 1, label: `series ${seriesId} episodes` });
+  if (response === PERMANENT_FAILURE) return PERMANENT_FAILURE;
   if (!response) return null;
   const raw = await response.json().catch(() => null);
   if (!raw?.data) return null;
@@ -416,7 +430,7 @@ async function fetchFavoritesList(token, userId, listKey, idField = "id") {
   const url = `https://app.tvtime.com/sidecar?o_b64=${btoa(innerUrl).replace(/=/g, '')}`;
 
   const response = await fetchSidecarWithRetry(url, token, { label: `favorites ${listKey}` });
-  if (!response) return [];
+  if (!response || response === PERMANENT_FAILURE) return [];
   const raw = await response.json().catch(() => null);
   const objects = raw?.data?.objects ?? raw?.objects ?? [];
   return objects.map(o => o?.[idField]).filter(v => v != null);
@@ -480,7 +494,7 @@ async function fetchListsViaTab(token, userId) {
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&expand=meta`;
 
   const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "custom lists" });
-  if (!r) {
+  if (!r || r === PERMANENT_FAILURE) {
     // Non-ok / network failure — the helper already tallied + logged the status.
     // Surface one panel line so the user knows lists were skipped and why.
     const why = lastSidecarFailure?.network ? "network error"
@@ -515,6 +529,7 @@ async function fetchMovieDetailViaTab(token, uuid) {
   const sidecarUrl = `https://app.tvtime.com/sidecar?o_b64=${b64}&random=true`;
 
   const r = await fetchSidecarWithRetry(sidecarUrl, token, { retries: 1, label: `movie ${uuid}` });
+  if (r === PERMANENT_FAILURE) return PERMANENT_FAILURE;
   if (!r) return null;
   const data = await r.json().catch(() => null);
   return data ?? null;
@@ -576,10 +591,13 @@ async function runExport(userId, token, tabId) {
 
     // Fetch avec retry sur résultat vide — jusqu'à 3 tentatives, délai 2s entre chaque.
     async function fetchWithRetry(entityType, pageLimit, maxRetries = 3) {
-      let results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit);
+      const onPage = (page, count) => {
+        exportState.step = `Step 1/5: Fetching your ${entityType} list... (page ${page}, ${count.toLocaleString()} so far)`;
+      };
+      let results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit, onPage);
       for (let attempt = 1; attempt < maxRetries && results.length === 0; attempt++) {
         await sleep(2000);
-        results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit);
+        results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit, onPage);
       }
       return results;
     }
@@ -596,7 +614,8 @@ async function runExport(userId, token, tabId) {
     throwIfCancelled();
 
     // Watches endpoint — picks up watched-but-not-followed movies.
-    const movieWatchesRaw    = await fetchObjectsViaTab(token, watchesBase, "movie", 100);
+    const movieWatchesRaw    = await fetchObjectsViaTab(token, watchesBase, "movie", 100,
+      (page, count) => { exportState.step = `Step 1/5: Fetching movie watch history... (page ${page}, ${count.toLocaleString()} so far)`; });
     throwIfCancelled();
     const followedMovieUuids = new Set(moviesFollowsRaw.map(m => m.uuid).filter(Boolean));
     const watchOnlyMovies    = movieWatchesRaw.filter(m => m.uuid && !followedMovieUuids.has(m.uuid));
@@ -614,6 +633,7 @@ async function runExport(userId, token, tabId) {
 
       for (let i = 0; i < watchOnlyMovies.length; i += WO_BATCH) {
         throwIfCancelled();
+        exportState.step = `Step 1/5: Fetching metadata for watch-only movies... (${Math.min(i + WO_BATCH, watchOnlyMovies.length)}/${watchOnlyMovies.length})`;
         const batch   = watchOnlyMovies.slice(i, i + WO_BATCH);
         const results = await Promise.allSettled(
           batch.map(m =>
@@ -626,7 +646,9 @@ async function runExport(userId, token, tabId) {
         results.forEach((res, j) => {
           const m    = batch[j];
           const data = res.status === "fulfilled" ? res.value : null;
-          if (data) {
+          if (data === PERMANENT_FAILURE) {
+            // 4xx — movie gone; keep meta absent (→ failedMovies), never re-queue.
+          } else if (data) {
             m.meta = data?.data ?? data;
           } else {
             woRetryList.push(m);
@@ -639,6 +661,7 @@ async function runExport(userId, token, tabId) {
       while (woRetryList.length > 0 && woAttempts < 3) {
         throwIfCancelled();
         woAttempts++;
+        exportState.step = `Step 1/5: Retrying metadata for ${woRetryList.length} watch-only movie(s)... (round ${woAttempts}/3)`;
         const stillFailed = [];
         for (let i = 0; i < woRetryList.length; i += WO_BATCH) {
           throwIfCancelled();
@@ -654,8 +677,9 @@ async function runExport(userId, token, tabId) {
           results.forEach((res, j) => {
             const m    = batch[j];
             const data = res.status === "fulfilled" ? res.value : null;
-            if (data) { m.meta = data?.data ?? data; }
-            else       { stillFailed.push(m); }
+            if (data === PERMANENT_FAILURE) { /* 4xx — drop from retries */ }
+            else if (data) { m.meta = data?.data ?? data; }
+            else           { stillFailed.push(m); }
           });
         }
         woRetryList = stillFailed;
@@ -694,7 +718,8 @@ async function runExport(userId, token, tabId) {
     // with response size. Direct msapi.tvtime.com calls fail with
     // 403 MissingAPIKey for Portugal users (only the sidecar authenticates
     // correctly). fetchObjectsViaTab logs URL + status on errors already.
-    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 100);
+    const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 100,
+      (page, count) => { exportState.step = `Step 2/5: Fetching watch history... (page ${page}, ${count.toLocaleString()} episodes so far)`; });
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
@@ -742,6 +767,7 @@ async function runExport(userId, token, tabId) {
     const BATCH_SIZE   = 10;
     const SHOW_TIMEOUT = 90000;
     const failedShows  = [];
+    const permanentFailedShows = []; // 4xx — reported as failed, excluded from every retry loop
 
     // Pré-calcul : liste plate des shows avec leur seriesId (TV Time ID) et title.
     // Le nouvel endpoint msapi.tvtime.com/v1/series/{seriesId}/episodes utilise
@@ -771,6 +797,12 @@ async function runExport(userId, token, tabId) {
       results.forEach((res, j) => {
         const show  = batch[j];
         const value = res.status === "fulfilled" ? res.value : null;
+        if (value === PERMANENT_FAILURE) {
+          // 4xx — series gone from the API; report it, never retry it.
+          show._ref.seasons = [];
+          permanentFailedShows.push(show);
+          return;
+        }
         show._ref.seasons = value?.seasons ?? [];
         if (!value) failedShows.push({ title: show.title, seriesId: show.seriesId });
       });
@@ -797,20 +829,17 @@ async function runExport(userId, token, tabId) {
 
       // Refresh JWT token at the start of each retry round — long exports can
       // outlast the token's lifetime; re-reading from localStorage picks up any
-      // token the TV Time app has already renewed automatically.
-      try {
-        const freshTokenResult = await chrome.scripting.executeScript({
-          target: { tabId },
-          world:  "MAIN",
-          func:   () => localStorage.getItem("flutter.jwtToken")?.replace(/^"|"$/g, "")
-        });
-        const freshToken = freshTokenResult?.[0]?.result;
-        if (freshToken) {
-          token = freshToken;
-          cachedCredentials = { ...cachedCredentials, token: freshToken };
+      // token the TV Time app has already renewed automatically. Uses the
+      // bounded getFreshToken helper (5 s watchdog): this loop can run 100+
+      // rounds and a frozen tab must never hang it. Null = keep current token.
+      {
+        const fresh = await getFreshToken(tabId);
+        if (fresh) {
+          token = fresh;
+          cachedCredentials = { ...cachedCredentials, token: fresh };
           chrome.storage.session.set({ credentials: cachedCredentials });
         }
-      } catch (_) { /* non-fatal — keep using the last known token */ }
+      }
 
       exportState.step = `⏳ Retrying ${before} failed series... (attempt ${totalAttempts + 1}, recovered ${totalRecovered} so far)`;
 
@@ -829,7 +858,9 @@ async function runExport(userId, token, tabId) {
         results.forEach((res, j) => {
           const show  = batch[j];
           const value = res.status === "fulfilled" ? res.value : null;
-          if (value) {
+          if (value === PERMANENT_FAILURE) {
+            permanentFailedShows.push(show); // 4xx mid-retry — drop from the list
+          } else if (value) {
             show._ref.seasons = value?.seasons ?? [];
           } else {
             stillFailed.push(show);
@@ -852,7 +883,7 @@ async function runExport(userId, token, tabId) {
 
     // failedShows entries still report tvdbId (from the show metadata) for the
     // CSV/JSON failure file — that output format is consumed by exporter.js.
-    const finalFailed = retryList.map(s => ({ title: s.title, tvdbId: s._ref?.meta?.id ?? null }));
+    const finalFailed = [...retryList, ...permanentFailedShows].map(s => ({ title: s.title, tvdbId: s._ref?.meta?.id ?? null }));
 
     // ── Retry shows that came back with 0 episodes — up to 3 attempts, 90s each ─
     // These shows fetched successfully but returned empty season data.
@@ -861,7 +892,9 @@ async function runExport(userId, token, tabId) {
     const RETRY_TIMEOUT  = 90000;
     const MAX_EP_RETRIES = 3;
 
+    const permanentSeriesIds = new Set(permanentFailedShows.map(s => s.seriesId));
     const zeroEpShows = showsNeedingSeasons.filter(show => {
+      if (permanentSeriesIds.has(show.seriesId)) return false; // 4xx — pointless to retry
       const seasons  = show._ref.seasons ?? [];
       const totalEps = seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
       return seasons.length === 0 || totalEps === 0;
@@ -873,8 +906,11 @@ async function runExport(userId, token, tabId) {
     if (zeroEpShows.length > 0) {
       exportState.step = `🔄 Retrying ${zeroEpShows.length} show(s) with no episode data (up to 3×90s)...`;
 
+      let zeroEpDone = 0;
       for (const show of zeroEpShows) {
         throwIfCancelled();
+        zeroEpDone++;
+        exportState.step = `🔄 Retrying show(s) with no episode data... (${zeroEpDone}/${zeroEpShows.length}, up to 3×90s each)`;
         let recovered = false;
         for (let attempt = 1; attempt <= MAX_EP_RETRIES; attempt++) {
           throwIfCancelled();
@@ -886,6 +922,7 @@ async function runExport(userId, token, tabId) {
             ]);
           } catch (_) { value = null; }
 
+          if (value === PERMANENT_FAILURE) break; // series gone — stop retrying this show
           if (value) {
             const seasons  = value?.seasons ?? [];
             const totalEps = seasons.reduce((sum, s) => sum + (s.episodes?.length ?? 0), 0);
@@ -1006,7 +1043,9 @@ async function runExport(userId, token, tabId) {
       results.forEach((res, j) => {
         const movie = batch[j];
         const data  = res.status === "fulfilled" ? res.value : null;
-        if (data) {
+        if (data === PERMANENT_FAILURE) {
+          // 4xx — movie gone; year stays null, never re-queued.
+        } else if (data) {
           const releaseDate = data?.first_release_date ?? data?.data?.first_release_date ?? null;
           if (releaseDate) movieYearMap.set(movie.uuid, new Date(releaseDate).getFullYear());
         } else {
@@ -1038,7 +1077,9 @@ async function runExport(userId, token, tabId) {
         results.forEach((res, j) => {
           const movie = batch[j];
           const data  = res.status === "fulfilled" ? res.value : null;
-          if (data) {
+          if (data === PERMANENT_FAILURE) {
+            // 4xx mid-retry — drop from the list.
+          } else if (data) {
             const releaseDate = data?.first_release_date ?? data?.data?.first_release_date ?? null;
             if (releaseDate) movieYearMap.set(movie.uuid, new Date(releaseDate).getFullYear());
           } else {
@@ -1063,7 +1104,7 @@ async function runExport(userId, token, tabId) {
     // Étape 5 — Listes utilisateur
     // -------------------------------------------------------------------------
     exportState.step      = "Step 5/5: Fetching your lists...";
-    exportState.stepIndex = 4;
+    exportState.stepIndex = 5;
 
     let listsRaw = [];
     try {
