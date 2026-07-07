@@ -263,6 +263,15 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
       }
       const delayMs = 1000 * Math.pow(2, attempt);
       console.warn(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset}, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms — url: ${url}`);
+      // Surface the retry in the popup — a failing first page used to mean
+      // minutes of a frozen label (up to 6×60s + backoff per page). Guarded:
+      // a label callback must never break the fetch.
+      if (onPage) {
+        try {
+          onPage(Math.floor(pageOffset / pageLimit) + 1, allObjects.length,
+                 `attempt ${attempt + 2}/${MAX_RETRIES + 1} — server busy, retrying`);
+        } catch (_) {}
+      }
       await new Promise(res => setTimeout(res, delayMs));
     }
     if (!r.ok) { // safety net: should be unreachable
@@ -591,8 +600,10 @@ async function runExport(userId, token, tabId) {
 
     // Fetch avec retry sur résultat vide — jusqu'à 3 tentatives, délai 2s entre chaque.
     async function fetchWithRetry(entityType, pageLimit, maxRetries = 3) {
-      const onPage = (page, count) => {
-        exportState.step = `Step 1/5: Fetching your ${entityType} list... (page ${page}, ${count.toLocaleString()} so far)`;
+      const onPage = (page, count, note) => {
+        exportState.step = note
+          ? `Step 1/5: Fetching your ${entityType} list... (page ${page}, ${note})`
+          : `Step 1/5: Fetching your ${entityType} list... (page ${page}, ${count.toLocaleString()} so far)`;
       };
       let results = await fetchObjectsViaTab(token, cgwBase, entityType, pageLimit, onPage);
       for (let attempt = 1; attempt < maxRetries && results.length === 0; attempt++) {
@@ -615,7 +626,9 @@ async function runExport(userId, token, tabId) {
 
     // Watches endpoint — picks up watched-but-not-followed movies.
     const movieWatchesRaw    = await fetchObjectsViaTab(token, watchesBase, "movie", 100,
-      (page, count) => { exportState.step = `Step 1/5: Fetching movie watch history... (page ${page}, ${count.toLocaleString()} so far)`; });
+      (page, count, note) => { exportState.step = note
+        ? `Step 1/5: Fetching movie watch history... (page ${page}, ${note})`
+        : `Step 1/5: Fetching movie watch history... (page ${page}, ${count.toLocaleString()} so far)`; });
     throwIfCancelled();
     const followedMovieUuids = new Set(moviesFollowsRaw.map(m => m.uuid).filter(Boolean));
     const watchOnlyMovies    = movieWatchesRaw.filter(m => m.uuid && !followedMovieUuids.has(m.uuid));
@@ -719,7 +732,9 @@ async function runExport(userId, token, tabId) {
     // 403 MissingAPIKey for Portugal users (only the sidecar authenticates
     // correctly). fetchObjectsViaTab logs URL + status on errors already.
     const episodeWatches = await fetchObjectsViaTab(token, watchesBase, "episode", 100,
-      (page, count) => { exportState.step = `Step 2/5: Fetching watch history... (page ${page}, ${count.toLocaleString()} episodes so far)`; });
+      (page, count, note) => { exportState.step = note
+        ? `Step 2/5: Fetching watch history... (page ${page}, ${note})`
+        : `Step 2/5: Fetching watch history... (page ${page}, ${count.toLocaleString()} episodes so far)`; });
     throwIfCancelled();
 
     // Filter episode watches to only include episodes from followed shows.
