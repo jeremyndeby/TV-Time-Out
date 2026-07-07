@@ -243,12 +243,14 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
         r = await fetchWithTimeout(url, { headers });
+        text = await r.text();
       } catch (fetchErr) {
-        // Timeout (AbortError) or network failure — synthesize a 5xx-like
-        // response so the existing retry/skip-and-continue logic applies.
-        r = { ok: false, status: 599, text: async () => `(${fetchErr.name ?? "network error"})` };
+        // Timeout (AbortError — during headers OR the body read) or network
+        // failure — synthesize a 5xx-like response so the existing
+        // retry/skip-and-continue logic applies unchanged.
+        r    = { ok: false, status: 599 };
+        text = `(${fetchErr?.name ?? "network error"})`;
       }
-      text = await r.text().catch(() => "");
       if (r.ok) break;
       if (r.status >= 400 && r.status < 500) {
         recordExportError(`${entityType} page @${pageOffset}: ${describeHttpStatus(r.status)} — stopping.`);
@@ -295,6 +297,19 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
     const objects = data?.data?.objects ?? [];
     if (objects.length === 0) break;
 
+    // Some regional backends (seen from Argentina) ignore page_limit on the
+    // watches endpoint and return the ENTIRE collection in one response —
+    // same class of bug as cgwBase ignoring page_offset. If a page returns
+    // more objects than requested, pagination is meaningless and we already
+    // have everything; requesting "page 2" would only re-download the same
+    // giant payload (and previously hung on the unbounded body read).
+    if (objects.length > pageLimit) {
+      allObjects = allObjects.concat(objects);
+      console.warn(`[TVTO] fetchObjectsViaTab (${entityType}): server ignored page_limit, got ${objects.length.toLocaleString()} in one response — pagination complete`);
+      if (onPage) { try { onPage(1, allObjects.length); } catch (_) {} }
+      break;
+    }
+
     const firstUuid = objects[0]?.uuid;
     if (firstUuid && firstUuid === lastFirstUuid) break;
 
@@ -338,11 +353,26 @@ const SIDECAR_TIMEOUT_MS = 60000;
 async function fetchWithTimeout(url, options = {}, timeoutMs = SIDECAR_TIMEOUT_MS) {
   const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let r;
   try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
+    r = await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
     clearTimeout(timer);
+    throw err;
   }
+  // fetch() resolves on HEADERS only. Clearing the timer here used to leave
+  // text()/json() unbounded — a slow-trickling giant body (24k objects from
+  // the Argentine backend) hung forever. Keep the watchdog armed until the
+  // body is actually consumed: on timeout the abort also rejects the
+  // in-flight body read, and callers' existing catch / 599 logic applies.
+  return {
+    ok:         r.ok,
+    status:     r.status,
+    statusText: r.statusText,
+    headers:    r.headers,
+    text: async () => { try { return await r.text(); } finally { clearTimeout(timer); } },
+    json: async () => { try { return await r.json(); } finally { clearTimeout(timer); } },
+  };
 }
 
 // Sentinel returned by fetchSidecarWithRetry on 4xx: the item is permanently
