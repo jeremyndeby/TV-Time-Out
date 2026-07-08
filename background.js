@@ -81,6 +81,10 @@ function describeHttpStatus(status) {
 // single-shot calls (e.g. custom lists) can report their exact status.
 let httpFailureTally  = {};
 let lastSidecarFailure = null; // { status } | { network: true }
+// entityType → last HTTP status seen this run ("network" for network errors).
+// Feeds the empty-export guard so 401 (expired session), 5xx (server down)
+// and 200-but-empty (empty account / format change) are distinguishable.
+let lastEntityStatus   = {};
 function tallyHttpFailure(key) { httpFailureTally[key] = (httpFailureTally[key] ?? 0) + 1; }
 function dominantFailureReason() {
   const entries = Object.entries(httpFailureTally);
@@ -251,6 +255,7 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
         r    = { ok: false, status: 599 };
         text = `(${fetchErr?.name ?? "network error"})`;
       }
+      lastEntityStatus[entityType] = r.status; // guard diagnostics (last seen wins)
       if (r.ok) break;
       if (r.status >= 400 && r.status < 500) {
         recordExportError(`${entityType} page @${pageOffset}: ${describeHttpStatus(r.status)} — stopping.`);
@@ -406,7 +411,10 @@ async function fetchSidecarWithRetry(url, token, { retries = 3, label = "sidecar
     if (r.status >= 400 && r.status < 500) {
       tallyHttpFailure(r.status);
       lastSidecarFailure = { status: r.status };
-      console.error(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — not retried`);
+      // warn, not error: an expected 4xx (deleted show/movie) must not show up
+      // as a red extension error in chrome://extensions and alarm users. It
+      // still reaches the Details panel via the end-of-run summaries.
+      console.warn(`[TVTO] ${label}: ${describeHttpStatus(r.status)} — not retried`);
       return PERMANENT_FAILURE; // 4xx is permanent — don't retry, don't re-queue
     }
     // 5xx (502/503/504…) — retry with backoff unless exhausted.
@@ -534,6 +542,7 @@ async function fetchListsViaTab(token, userId) {
 
   const r = await fetchSidecarWithRetry(sidecarUrl, token, { label: "custom lists" });
   if (!r || r === PERMANENT_FAILURE) {
+    lastEntityStatus.lists = lastSidecarFailure?.network ? "network" : (lastSidecarFailure?.status ?? null);
     // Non-ok / network failure — the helper already tallied + logged the status.
     // Surface one panel line so the user knows lists were skipped and why.
     const why = lastSidecarFailure?.network ? "network error"
@@ -542,6 +551,7 @@ async function fetchListsViaTab(token, userId) {
     recordExportError(`Custom lists skipped — ${why}.`);
     return [];
   }
+  lastEntityStatus.lists = r.status;
   const text = await r.text();
   let raw;
   try {
@@ -590,7 +600,7 @@ async function fetchMovieDetailViaTab(token, uuid) {
 async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
   exportErrors = []; // fresh log for this run
-  httpFailureTally = {}; lastSidecarFailure = null;
+  httpFailureTally = {}; lastSidecarFailure = null; lastEntityStatus = {};
 
   // Pin the TV Time tab for the duration of the export — Memory Saver
   // discarding the tab mid-run hangs MAIN-world executeScript (token refresh)
@@ -1198,10 +1208,31 @@ async function runExport(userId, token, tabId) {
     // Fail loudly instead so the user knows to retry rather than trusting an
     // empty file. (A user with only custom lists still gets their export.)
     if (shows.length === 0 && movies.length === 0 && lists.length === 0) {
+      // Diagnostic: without the underlying HTTP statuses neither the user nor
+      // support can tell an expired session (401/403) from server trouble
+      // (5xx/599) from a genuinely empty account (200s but no objects).
+      const fmt = s => s == null ? "no response" : (s === "network" ? "network error" : `HTTP ${s}`);
+      const showsStatus = lastEntityStatus.series ?? lastEntityStatus.anime ?? null;
+      const movieStatus = lastEntityStatus.movie ?? null;
+      const listsStatus = lastEntityStatus.lists ?? null;
+      const all       = [showsStatus, movieStatus, listsStatus];
+      const numeric   = all.filter(s => typeof s === "number");
+      const isAuth    = numeric.length > 0 && numeric.every(s => s === 401 || s === 403);
+      const isServer  = numeric.some(s => s >= 500);
+      const isNetwork = all.includes("network");
+      const allOk     = numeric.length > 0 && numeric.every(s => s === 200);
+      const verdict = isAuth    ? "session likely expired"
+                    : isServer  ? "TV Time servers temporarily unavailable"
+                    : isNetwork ? "network errors — check your connection"
+                    : allOk     ? "server answered normally — account may be empty, or the response format changed"
+                    :             "cause unclear";
+      recordExportError(`Last server responses: shows ${fmt(showsStatus)}, movies ${fmt(movieStatus)}, lists ${fmt(listsStatus)} — ${verdict}.`);
       throw new Error(
-        "Export returned no shows, no movies and no lists. Your TV Time session likely " +
-        "expired or the server is temporarily unavailable. Reload app.tvtime.com, " +
-        "make sure you're logged in, then try again."
+          isAuth   ? "Export returned no data — your TV Time session has expired. Log in again at app.tvtime.com, then retry."
+        : isServer ? "Export returned no data — TV Time servers are temporarily unavailable. Please retry in a few minutes."
+        : "Export returned no shows, no movies and no lists. Your TV Time session likely " +
+          "expired or the server is temporarily unavailable. Reload app.tvtime.com, " +
+          "make sure you're logged in, then try again."
       );
     }
 
