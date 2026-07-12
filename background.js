@@ -243,8 +243,10 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
     // (1s, 2s, 4s, 8s, 16s). 4xx errors (auth) still break immediately so
     // we do not hammer the API on permanent failures.
     const MAX_RETRIES = 5;
-    let r, text;
+    let r, text, data;
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      data = undefined;
+      let jsonFail = null;
       try {
         r = await fetchWithTimeout(url, { headers });
         text = await r.text();
@@ -256,20 +258,38 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
         text = `(${fetchErr?.name ?? "network error"})`;
       }
       lastEntityStatus[entityType] = r.status; // guard diagnostics (last seen wins)
-      if (r.ok) break;
+      // A 200 can still carry a truncated/incomplete body when the server is
+      // overloaded (HTTP 200 but "Unexpected end of JSON input"). Parse INSIDE
+      // the retry loop so a JSON.parse failure on a 200 is treated as a
+      // RETRYABLE transient failure — synthesize a 599 and fall through to the
+      // same backoff/skip logic as 5xx. A truncated body is usually transient,
+      // so a retry often gets a complete response; a genuinely malformed body
+      // keeps failing and is skipped after retries, same as before.
+      if (r.ok) {
+        try {
+          data = JSON.parse(text);
+          break; // parsed a complete body — done retrying
+        } catch (jsonErr) {
+          jsonFail = jsonErr.message;
+          r = { ok: false, status: 599 };
+          lastEntityStatus[entityType] = r.status;
+        }
+      }
       if (r.status >= 400 && r.status < 500) {
         recordExportError(`${entityType} page @${pageOffset}: ${describeHttpStatus(r.status)} — stopping.`);
         break pageLoop; // 4xx: return whatever we've collected so far
       }
       if (attempt >= MAX_RETRIES) {
-        recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} — exhausted ${MAX_RETRIES} retries, skipping page`);
+        recordExportError(jsonFail
+          ? `${entityType} page @${pageOffset}: HTTP 200 but response was not valid JSON (${jsonFail}) — exhausted ${MAX_RETRIES} retries, skipping page`
+          : `${entityType} page @${pageOffset}: HTTP ${r.status} — exhausted ${MAX_RETRIES} retries, skipping page`);
         consecutiveFails++;
         if (consecutiveFails >= MAX_CONSEC_FAILS) { break pageLoop; }
         pageOffset += pageLimit;
         continue pageLoop;
       }
       const delayMs = 1000 * Math.pow(2, attempt);
-      console.warn(`[TVTO] fetchObjectsViaTab HTTP ${r.status} at offset ${pageOffset}, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms — url: ${url}`);
+      console.warn(`[TVTO] fetchObjectsViaTab ${jsonFail ? 'truncated JSON (HTTP 200)' : 'HTTP ' + r.status} at offset ${pageOffset}, retry ${attempt + 1}/${MAX_RETRIES} in ${delayMs}ms — url: ${url}`);
       // Surface the retry in the popup — a failing first page used to mean
       // minutes of a frozen label (up to 6×60s + backoff per page). Guarded:
       // a label callback must never break the fetch.
@@ -288,17 +308,8 @@ async function fetchObjectsViaTab(token, innerUrl, entityType, pageLimit, onPage
       continue pageLoop;
     }
 
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (jsonErr) {
-      recordExportError(`${entityType} page @${pageOffset}: HTTP ${r.status} but response was not valid JSON (${jsonErr.message}) — skipping page`);
-      consecutiveFails++;
-      if (consecutiveFails >= MAX_CONSEC_FAILS) break pageLoop;
-      pageOffset += pageLimit;
-      continue pageLoop;
-    }
-
+    // data was parsed inside the retry loop above (a truncated body on a 200
+    // is retried there, not skipped here).
     const objects = data?.data?.objects ?? [];
     if (objects.length === 0) break;
 
