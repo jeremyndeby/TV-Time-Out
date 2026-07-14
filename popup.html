@@ -257,6 +257,21 @@
     #warning-bar.visible,
     #warning-bar-movies.visible { display: block; }
 
+    /* Server-overload notice — persistent line above the progress bar while
+       TV Time's backend is throwing 5xx, so users don't blame the extension. */
+    #server-notice {
+      display: none;
+      font-size: 0.75rem;
+      color: #f5a623;
+      background: rgba(245, 166, 35, 0.1);
+      border: 1px solid rgba(245, 166, 35, 0.35);
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-top: 10px;
+      line-height: 1.4;
+    }
+    #server-notice.visible { display: block; }
+
     /* Error log — collapsible, collapsed by default. Populated on done/error
        so users can see what went wrong without opening the SW console. */
     #error-log {
@@ -342,6 +357,8 @@
   <div id="status-bar">
     <span id="status-text">Please log in at <a href="https://app.tvtime.com" target="_blank" style="color: #f5c518;">app.tvtime.com</a> to get started.</span>
   </div>
+
+  <div id="server-notice"></div>
 
   <div id="progress-wrap">
     <div class="progress-bar-bg">

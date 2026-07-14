@@ -40,6 +40,7 @@ let exportState = {
   total:      null,
   result:     null,     // { shows, movies, lists } quand done
   error:      null,
+  notice:     null,     // persistent server-overload notice shown above the popup progress bar
   format:     "json",   // "json" | "csv" | "both" — passed from popup at START_EXPORT
   zipBundle:  false,    // true → bundle all outputs into a single .zip download
   errors:     []        // human-readable log lines surfaced in the popup (see recordExportError)
@@ -85,7 +86,44 @@ let lastSidecarFailure = null; // { status } | { network: true }
 // Feeds the empty-export guard so 401 (expired session), 5xx (server down)
 // and 200-but-empty (empty account / format change) are distinguishable.
 let lastEntityStatus   = {};
-function tallyHttpFailure(key) { httpFailureTally[key] = (httpFailureTally[key] ?? 0) + 1; }
+const SERVER_NOTICE_THRESHOLD = 10; // accumulated 5xx/599/network failures before the popup notice
+function serverSideFailureCount() {
+  return Object.entries(httpFailureTally).reduce((acc, [k, v]) => {
+    const n = Number(k);
+    return acc + ((k === "network" || (n >= 500 && n <= 599)) ? v : 0);
+  }, 0);
+}
+// True when this run's failures are dominated by server-side trouble
+// (5xx/599/network) rather than 4xx — the only case where "TV Time server
+// issue" framing is honest. Never true for an empty tally or a 4xx-dominant
+// run (expired session, deleted shows, empty account).
+function serverIssueDominant() {
+  let server = 0, client = 0;
+  for (const [k, v] of Object.entries(httpFailureTally)) {
+    const n = Number(k);
+    if (k === "network" || (n >= 500 && n <= 599)) server += v;
+    else client += v;
+  }
+  return server > 0 && server >= client;
+}
+function tallyHttpFailure(key) {
+  httpFailureTally[key] = (httpFailureTally[key] ?? 0) + 1;
+  // Server-overload notice — persistent line above the popup progress bar so
+  // users stop attributing TV Time's 5xx storms to the extension. 4xx never
+  // trips this (that's a session/account problem, not server overload).
+  if (exportState.status === "running" && !exportState.notice &&
+      serverSideFailureCount() >= SERVER_NOTICE_THRESHOLD) {
+    exportState.notice = "TV Time's servers are currently overloaded (this is on their side, not the extension). " +
+                         "The export continues and will grab everything it can.";
+  }
+}
+// "42s", "4m", "4m30s" — compact elapsed-time label for retry-phase progress.
+function formatElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60), rem = s % 60;
+  return rem ? `${m}m${rem}s` : `${m}m`;
+}
 function dominantFailureReason() {
   const entries = Object.entries(httpFailureTally);
   if (!entries.length) return null;
@@ -168,7 +206,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const best = tabs.find(t => t.status === "complete" && !t.discarded) ?? tabs[0];
 
         exportCancelled = false;
-        exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null, format, zipBundle };
+        exportState = { status: "running", step: "Step 1/5: Fetching your shows...", stepIndex: 1, fetchCount: "", loaded: 0, total: null, result: null, error: null, notice: null, format, zipBundle };
         sendResponse({ ok: true });
 
         runExport(userId, token, best.id);
@@ -393,7 +431,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = SIDECAR_TIMEOUT_M
 
 // Sentinel returned by fetchSidecarWithRetry on 4xx: the item is permanently
 // gone (deleted show/movie, bad id). Callers must report it as failed but
-// NEVER re-queue it — the 100/50-round retry floors only make sense for
+// NEVER re-queue it — the bounded retry rounds only make sense for
 // transient failures (5xx/599/network).
 const PERMANENT_FAILURE = Symbol("permanent-4xx-failure");
 
@@ -612,6 +650,7 @@ async function runExport(userId, token, tabId) {
   const exportStartTime = Date.now();
   exportErrors = []; // fresh log for this run
   httpFailureTally = {}; lastSidecarFailure = null; lastEntityStatus = {};
+  exportState.notice = null; // fresh run — clear any server-overload notice
 
   // Pin the TV Time tab for the duration of the export — Memory Saver
   // discarding the tab mid-run hangs MAIN-world executeScript (token refresh)
@@ -880,7 +919,9 @@ async function runExport(userId, token, tabId) {
     }
 
     // Retry des séries échouées —
-    // Au moins 50 tentatives garanties, puis arrêt si 10 rounds consécutifs sans amélioration.
+    // Bounded: stop after >=10 rounds once 3 consecutive rounds bring no
+    // improvement, or when the 10-minute wall-clock budget is exhausted
+    // (the old 100-round floor could grind for 12h+ on an overloaded backend).
     let retryList          = failedShows
       .map(f => showsNeedingSeasons.find(s => s.seriesId === f.seriesId))
       .filter(Boolean);
@@ -888,16 +929,22 @@ async function runExport(userId, token, tabId) {
     let totalAttempts      = 0;
     let noImprovementCount = 0;
     let totalRecovered     = 0;
+    const SERIES_RETRY_BUDGET_MS = 10 * 60 * 1000; // wall-clock cap for the whole retry phase
+    const seriesRetryStart       = Date.now();
 
     while (retryList.length > 0) {
       throwIfCancelled();
+      if (Date.now() - seriesRetryStart >= SERIES_RETRY_BUDGET_MS) {
+        recordExportError(`${serverIssueDominant() ? "[TV Time server issue] " : ""}${retryList.length} series could not be fully fetched after retrying for 10 minutes — run the export again later to fill the gaps.`);
+        break;
+      }
       const before = retryList.length;
 
       // Refresh JWT token at the start of each retry round — long exports can
       // outlast the token's lifetime; re-reading from localStorage picks up any
       // token the TV Time app has already renewed automatically. Uses the
-      // bounded getFreshToken helper (5 s watchdog): this loop can run 100+
-      // rounds and a frozen tab must never hang it. Null = keep current token.
+      // bounded getFreshToken helper (5 s watchdog): a frozen tab must never
+      // hang the retry loop. Null = keep current token.
       {
         const fresh = await getFreshToken(tabId);
         if (fresh) {
@@ -907,7 +954,7 @@ async function runExport(userId, token, tabId) {
         }
       }
 
-      exportState.step = `⏳ Retrying ${before} failed series... (attempt ${totalAttempts + 1}, recovered ${totalRecovered} so far)`;
+      exportState.step = `⏳ Retrying ${before} failed series... (round ${totalAttempts + 1}, ${formatElapsed(Date.now() - seriesRetryStart)} elapsed, ${totalRecovered} recovered)`;
 
       const stillFailed = [];
       for (let i = 0; i < retryList.length; i += BATCH_SIZE) {
@@ -944,7 +991,7 @@ async function runExport(userId, token, tabId) {
         noImprovementCount++;
       }
 
-      if (totalAttempts >= 100 && noImprovementCount >= 20) break;
+      if (totalAttempts >= 10 && noImprovementCount >= 3) break;
     }
 
     // failedShows entries still report tvdbId (from the show metadata) for the
@@ -1010,7 +1057,9 @@ async function runExport(userId, token, tabId) {
     // Séries + animés → { uuid, id, created_at, title, status, seasons[] }
     const shows = showsRaw.map(show => ({
       uuid:             show.uuid                           ?? null,
-      id:               { tvdb: show.meta?.id ?? null, imdb: null },
+      id:               { tvdb: show.meta?.id ?? null,
+                          imdb: show.meta?.external_sources?.find?.(s => s.source === "imdb" || s.source === "IMDB")?.id
+                                ?? show.meta?.imdb_id ?? show.meta?.id_imdb ?? null },
       created_at:       show.created_at                    ?? null,
       title:            show.meta?.name ?? show.meta?.title ?? null,
       status:           show.filter?.[1] ?? "unknown",
@@ -1121,12 +1170,19 @@ async function runExport(userId, token, tabId) {
       exportState.step = `Step 4/5: Fetching movie details... (${Math.min(i + MOVIE_BATCH, moviesWithUuid.length)}/${moviesWithUuid.length})`;
     }
 
-    // Retry loop
+    // Retry loop — bounded: stop after >=5 rounds once 3 consecutive rounds
+    // bring no improvement, or when the 5-minute wall-clock budget runs out.
     let mAttempts = 0, mNoImprove = 0, mRecovered = 0;
+    const MOVIE_RETRY_BUDGET_MS = 5 * 60 * 1000;
+    const movieRetryStart       = Date.now();
     while (movieRetryList.length > 0) {
       throwIfCancelled();
+      if (Date.now() - movieRetryStart >= MOVIE_RETRY_BUDGET_MS) {
+        recordExportError(`${serverIssueDominant() ? "[TV Time server issue] " : ""}${movieRetryList.length} movie(s) could not be fully fetched after retrying for 5 minutes — run the export again later to fill the gaps.`);
+        break;
+      }
       const before = movieRetryList.length;
-      exportState.step = `⏳ Retrying ${before} failed movie details... (attempt ${mAttempts + 1}, recovered ${mRecovered} so far)`;
+      exportState.step = `⏳ Retrying ${before} failed movie details... (round ${mAttempts + 1}, ${formatElapsed(Date.now() - movieRetryStart)} elapsed, ${mRecovered} recovered)`;
 
       const stillFailed = [];
       for (let i = 0; i < movieRetryList.length; i += MOVIE_BATCH) {
@@ -1158,7 +1214,7 @@ async function runExport(userId, token, tabId) {
       mAttempts++;
       if (movieRetryList.length < before) { mRecovered += before - movieRetryList.length; mNoImprove = 0; }
       else mNoImprove++;
-      if (mAttempts >= 50 && mNoImprove >= 10) break;
+      if (mAttempts >= 5 && mNoImprove >= 3) break;
     }
 
     // Apply years to movie objects
@@ -1181,6 +1237,14 @@ async function runExport(userId, token, tabId) {
       recordExportError(`Custom lists skipped — ${listsErr.message}`);
     }
 
+    // Enrich list items with external IDs already fetched this run — raw list
+    // objects only carry the TV Time internal id (series) / uuid (movies).
+    // Resolved from the in-memory shows/movies collections: NO extra network.
+    // Items absent from the collections (not followed, not watched) keep
+    // exactly their current fields.
+    const showByTvdbId = new Map(shows.filter(s => s.id?.tvdb != null).map(s => [String(s.id.tvdb), s]));
+    const movieByUuid  = new Map(movies.filter(m => m.uuid).map(m => [m.uuid, m]));
+
     const lists = listsRaw.map(list => ({
       id:          list.id          ?? null,
       name:        list.name        ?? null,
@@ -1189,16 +1253,20 @@ async function runExport(userId, token, tabId) {
       created_at:  list.created_at  ?? null,
       items: (list.objects ?? []).map((obj, idx) => {
         if (obj.type === "series") {
+          const known = obj.id != null ? showByTvdbId.get(String(obj.id)) : undefined;
           return {
             type:         "series",
             tvdb_id:      obj.id   ?? null,
+            ...(known ? { imdb_id: known.id?.imdb ?? null } : {}),
             name:         obj.name ?? null,
             custom_order: obj.custom_order ?? idx
           };
         }
+        const known = obj.uuid ? movieByUuid.get(obj.uuid) : undefined;
         return {
           type:         "movie",
           uuid:         obj.uuid ?? null,
+          ...(known ? { tvdb_id: known.id?.tvdb ?? null, imdb_id: known.id?.imdb ?? null } : {}),
           name:         obj.name ?? null,
           custom_order: obj.custom_order ?? idx
         };
@@ -1249,14 +1317,25 @@ async function runExport(userId, token, tabId) {
 
     // Summarise partial failures into the error log so they surface in the
     // popup alongside any transient fetch errors already recorded.
+    // Server-blame framing — only when this run's failures are dominated by
+    // 5xx/599/network (never 4xx, never an empty account): users kept
+    // attributing TV Time's server outages to the extension.
+    const serverBlame = serverIssueDominant();
+    const blamePrefix = serverBlame ? "[TV Time server issue] " : "";
     if (finalFailed.length > 0) {
       const reason = dominantFailureReason();
-      recordExportError(`${finalFailed.length} series could not be fully fetched (missing seasons/episodes)${reason ? ` — most common error: ${reason}` : ""}.`);
+      recordExportError(`${blamePrefix}${finalFailed.length} series could not be fully fetched (missing seasons/episodes)${reason ? ` — most common error: ${reason}` : ""}.`);
     }
     if (failedMovies.length > 0) {
       const reason = dominantFailureReason();
-      recordExportError(`${failedMovies.length} movie(s) could not be exported (no metadata)${reason ? ` — most common error: ${reason}` : ""}.`);
+      recordExportError(`${blamePrefix}${failedMovies.length} movie(s) could not be exported (no metadata)${reason ? ` — most common error: ${reason}` : ""}.`);
     }
+    const missedTotal      = finalFailed.length + failedMovies.length;
+    const completionNotice = (serverBlame && missedTotal > 0)
+      ? `Export complete. ${missedTotal} show(s)/movie(s) couldn't be fetched because TV Time's servers kept failing (HTTP 5xx) — ` +
+        `this is a TV Time server issue, not an extension bug. Run the export again later to fill the gaps; ` +
+        `already-fetched data will simply be re-exported.`
+      : null;
 
     const result = { shows, movies, lists, failedShows: finalFailed, failedMovies, watchedEpisodes, durationMs: Date.now() - exportStartTime, zipBundle: exportState.zipBundle };
 
@@ -1271,6 +1350,7 @@ async function runExport(userId, token, tabId) {
       count:     shows.length,
       result,
       error:     null,
+      notice:    completionNotice,
       format:    exportState.format,
       zipBundle: exportState.zipBundle,
       errors:    exportErrors.slice()

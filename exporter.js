@@ -162,7 +162,7 @@ function buildWatchedMoviesCsv(movies) {
 }
 
 function buildListsCsv(lists) {
-  const header = ["list_id", "list_name", "item_type", "tvdb_id", "uuid", "name", "custom_order"];
+  const header = ["list_id", "list_name", "item_type", "tvdb_id", "imdb_id", "uuid", "name", "custom_order"];
   const rows   = [];
   for (const list of lists) {
     for (const item of (list.items ?? [])) {
@@ -170,7 +170,8 @@ function buildListsCsv(lists) {
         list.id,
         list.name,
         item.type,
-        item.type === "series" ? item.tvdb_id : null,
+        item.tvdb_id ?? null,
+        item.imdb_id ?? null,
         item.type === "movie"  ? item.uuid    : null,
         item.name,
         item.custom_order

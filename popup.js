@@ -28,6 +28,7 @@ const zipToggle        = document.getElementById("zip-toggle");
 const errorLog         = document.getElementById("error-log");
 const errorLogSummary  = document.getElementById("error-log-summary");
 const errorLogContent  = document.getElementById("error-log-content");
+const serverNotice     = document.getElementById("server-notice");
 
 // ---------------------------------------------------------------------------
 // Local state
@@ -103,6 +104,19 @@ function renderErrorLog(errors) {
   errorLogContent.textContent = lines.join("\n");
   errorLogSummary.textContent = `Details (${lines.length} issue${lines.length === 1 ? "" : "s"})`;
   errorLog.classList.add("visible");
+}
+
+// Persistent server-overload / server-blame notice — rendered above the
+// progress bar while running, kept on completion when server-side misses
+// remain. Hidden whenever the background reports no notice.
+function renderNotice(text) {
+  if (text) {
+    serverNotice.textContent = text;
+    serverNotice.classList.add("visible");
+  } else {
+    serverNotice.textContent = "";
+    serverNotice.classList.remove("visible");
+  }
 }
 
 function showCancelButton() {
@@ -318,6 +332,10 @@ function handleExportDone(state) {
   // Error log — collapsed by default; shows any issues collected during the run.
   renderErrorLog(state?.errors);
 
+  // Completion notice — explicit server-blame summary when the misses were
+  // caused by TV Time's servers (set by background.js, null otherwise).
+  renderNotice(state?.notice ?? null);
+
   // Auto-download — no user click required.
   // When zipBundle is true the service worker already produced a single zip
   // via chrome.downloads.download; the popup must not call downloadAll().
@@ -362,6 +380,7 @@ function handleExportState(state) {
     case "running":
       showProgress(state.stepIndex, state.fetchCount, state.pct ?? null);
       setStatus(state.step || "Fetching your data…", "running", true);
+      renderNotice(state.notice ?? null);
       btnExport.disabled = true;
       showCancelButton();
       break;
@@ -375,6 +394,7 @@ function handleExportState(state) {
       stopTimer();
       resetToIdle();
       setStatus("Export cancelled.", "info");
+      renderNotice(null);
       break;
 
     case "error":
@@ -383,6 +403,7 @@ function handleExportState(state) {
       resetToIdle();
       setStatus(`Error: ${state.error}`, "error");
       renderErrorLog(state.errors);
+      renderNotice(state.notice ?? null);
       break;
 
     default:
@@ -441,6 +462,7 @@ async function init() {
 
   if (state.status === "running") {
     setStatus(state.step || "Fetching your data...", "running", true);
+    renderNotice(state.notice ?? null);
     btnExport.disabled = true;
     showCancelButton();
     chrome.storage.local.get(["exportStartTime"], (data) => {
@@ -507,6 +529,7 @@ btnExport.addEventListener("click", async () => {
 
   setStatus("Starting export…", "running", true);
   renderErrorLog([]); // clear any log from a previous run
+  renderNotice(null); // clear any notice from a previous run
   btnExport.disabled = true;
   showCancelButton();
   showProgress();
